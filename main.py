@@ -168,16 +168,19 @@ class MazeApp:
 
     def _build_controls(self) -> None:
         y = 0  # relative to controls strip; absolute set in draw
+        # Left cluster: action buttons
         self.btn_new = Button(pygame.Rect(10, y, 100, 36), "New Maze", self.generate_new_maze)
         self.btn_start = Button(
-            pygame.Rect(120, y, 90, 36),
+            pygame.Rect(120, y, 100, 36),
             "Start",
             self.on_play_pause,
             toggle_labels=("▶ Start", "⏸ Pause"),
         )
-        self.btn_reset = Button(pygame.Rect(220, y, 80, 36), "Reset", self.reset_solving)
+        self.btn_reset = Button(pygame.Rect(230, y, 80, 36), "Reset", self.reset_solving)
         self.btn_reset.enabled = False
-        self.slider = Slider(pygame.Rect(420, y + 8, 140, 20), 1, 100, 60)
+        # Explorer selector is drawn in _draw (wider, after Reset).
+        # Speed slider sits after the explorer block (see _draw for x).
+        self.slider = Slider(pygame.Rect(560, y + 8, 120, 20), 1, 100, 60)
         self.buttons: List[Button] = [self.btn_new, self.btn_start, self.btn_reset]
 
     def generate_new_maze(self) -> None:
@@ -335,7 +338,12 @@ class MazeApp:
         pygame.quit()
 
     def _explorer_rect(self) -> pygame.Rect:
-        return pygame.Rect(310, self.screen.get_height() - self.controls_height + 10, 100, 36)
+        # Updated each frame in _draw; fall back to a safe rect before first draw.
+        return getattr(
+            self,
+            "_exp_rect",
+            pygame.Rect(320, self.screen.get_height() - self.controls_height + 10, 170, 36),
+        )
 
     def _draw(self) -> None:
         self.screen.fill(UI_BG)
@@ -351,36 +359,56 @@ class MazeApp:
             pygame.Rect(0, strip_y, self.screen.get_width(), self.controls_height),
         )
 
-        # Position buttons
+        # Position buttons (New / Start / Reset) — fixed left cluster
         for btn in self.buttons:
             btn.rect.y = strip_y + 10
             btn.draw(self.screen, self.font)
 
+        # ---- Sequential layout from measured text widths ----
+        GAP = 8
+        row_y = strip_y + 10
+        text_y = strip_y + 18
+        x = self.btn_reset.rect.right + GAP * 2
+
         # Explorer selector (clickable)
         name = self.explorer_names[self.selected_explorer]
-        exp_rect = pygame.Rect(310, strip_y + 10, 100, 36)
-        pygame.draw.rect(self.screen, UI_BTN, exp_rect, border_radius=6)
-        # Truncate long names
-        label = name if len(name) < 14 else name[:12] + "…"
+        label = name if len(name) <= 22 else name[:20] + "…"
         text = self.font.render(label, True, UI_FG)
+        pad_x = 14
+        exp_w = max(120, text.get_width() + pad_x * 2)
+        exp_h = 36
+        exp_rect = pygame.Rect(x, row_y, exp_w, exp_h)
+        self._exp_rect = exp_rect  # keep click target in sync
+        pygame.draw.rect(self.screen, UI_BTN, exp_rect, border_radius=6)
+        # Fit name inside the wider button
         self.screen.blit(
             text,
-            (exp_rect.x + (exp_rect.w - text.get_width()) // 2,
-             exp_rect.y + (exp_rect.h - text.get_height()) // 2),
+            (
+                exp_rect.x + (exp_rect.w - text.get_width()) // 2,
+                exp_rect.y + (exp_rect.h - text.get_height()) // 2,
+            ),
         )
-        # Arrow hints
+        x = exp_rect.right + GAP
+
+        # Arrow hints just to the right of the selector
         hint = self.font_status.render("◀ ▶", True, UI_STATUS)
-        self.screen.blit(hint, (exp_rect.right + 4, exp_rect.y + 10))
+        self.screen.blit(hint, (x, text_y))
+        x += hint.get_width() + GAP * 2
 
-        # Speed label + slider
+        # Speed label + slider — clear of the explorer block (ends ~520)
         spd = self.font_status.render("Speed", True, UI_STATUS)
-        self.screen.blit(spd, (380, strip_y + 18))
-        self.slider.rect.y = strip_y + 18
-        self.slider.draw(self.screen)
+        self.screen.blit(spd, (x, text_y))
+        x += spd.get_width() + GAP
 
-        # Status
+        # Slider
+        self.slider.rect.x = x
+        self.slider.rect.y = text_y
+        self.slider.draw(self.screen)
+        x = self.slider.rect.right + GAP * 2
+
+        # Status — after the slider
         status_surf = self.font_status.render(self.status, True, UI_STATUS)
-        self.screen.blit(status_surf, (580, strip_y + 18))
+        self.screen.blit(status_surf, (x, text_y))
 
 
 def main() -> None:
