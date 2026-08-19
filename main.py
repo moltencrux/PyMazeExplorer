@@ -147,6 +147,7 @@ class Slider:
         self.min_v = min_v
         self.max_v = max_v
         self.value = value
+        self.font = pygame.font.SysFont("sans", 20, bold=True)
         self.dragging = False
 
     def handle_event(self, event: pygame.event.Event) -> bool:
@@ -168,7 +169,23 @@ class Slider:
         self.value = int(self.min_v + t * (self.max_v - self.min_v))
 
     def draw(self, surface: pygame.Surface) -> None:
-        # track
+        label_color = (220, 220, 220)
+
+        # Labels above the bar, aligned with its left and right edges.
+        minus_label = self.font.render("-", True, label_color)
+        plus_label = self.font.render("+", True, label_color)
+
+        minus_rect = minus_label.get_rect(
+            left=self.rect.left, bottom=self.rect.top + 5
+        )
+        plus_rect = plus_label.get_rect(
+            right=self.rect.right, bottom=self.rect.top + 5
+        )
+
+        surface.blit(minus_label, minus_rect)
+        surface.blit(plus_label, plus_rect)
+
+        # Track
         mid_y = self.rect.centery
         pygame.draw.line(
             surface, (100, 110, 130),
@@ -430,12 +447,8 @@ class MazeApp:
             btn.draw(self.screen)
 
         # ---- Sequential layout for the remainder ----
-        x = self.btn_explorer.rect.right + GAP
+        x = self.btn_explorer.rect.right + GAP * 2
 
-        # Arrow hints
-        hint = self.font_status.render("◀ ▶", True, UI_STATUS)
-        self.screen.blit(hint, (x, text_y))
-        x += hint.get_width() + GAP * 2
 
         # "Speed" label
         spd = self.font_status.render("Speed", True, UI_STATUS)
