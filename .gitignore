@@ -1,0 +1,19 @@
+# Editor
+.*.sw?
+.swp*
+.vscode/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# Django
+
+# Project data (large, generated)
+tmp/
