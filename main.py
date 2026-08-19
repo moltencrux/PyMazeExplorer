@@ -58,29 +58,67 @@ class SolveState(Enum):
 
 
 class Button:
+    """Auto-sized button. Width is the widest label it may display, plus padding."""
+
     def __init__(
         self,
-        rect: pygame.Rect,
+        x: int,
+        y: int,
         label: str,
         on_click: Callable[[], None],
+        font: pygame.font.Font,
         *,
         toggle_labels: Optional[Tuple[str, str]] = None,
+        size_labels: Optional[List[str]] = None,
+        pad_x: int = 14,
+        pad_y: int = 8,
+        min_width: int = 0,
+        height: Optional[int] = None,
     ) -> None:
-        self.rect = rect
         self.label = label
         self.on_click = on_click
         self.toggle_labels = toggle_labels  # (play, pause) or None
         self.enabled = True
         self.hovered = False
         self.mode = 0  # for toggle: 0 = first label, 1 = second
+        self._font = font
+        self._pad_x = pad_x
+        self._pad_y = pad_y
+        self._min_width = min_width
+        self._fixed_height = height
+        # Labels used only for width calculation (e.g. all explorer names).
+        self._size_labels = list(size_labels) if size_labels else None
+        self.rect = pygame.Rect(x, y, 0, 0)
+        self._recompute_size()
 
     def set_mode(self, mode: int) -> None:
         self.mode = mode
+
+    def set_label(self, label: str) -> None:
+        """Update the displayed label without changing the button width."""
+        self.label = label
 
     def current_label(self) -> str:
         if self.toggle_labels is not None:
             return self.toggle_labels[self.mode]
         return self.label
+
+    def _sizing_labels(self) -> List[str]:
+        if self._size_labels is not None:
+            return self._size_labels
+        if self.toggle_labels is not None:
+            return list(self.toggle_labels)
+        return [self.label]
+
+    def _recompute_size(self) -> None:
+        labels = self._sizing_labels()
+        max_w = max(self._font.size(s)[0] for s in labels)
+        if self._fixed_height is not None:
+            h = self._fixed_height
+        else:
+            h = self._font.size(labels[0])[1] + self._pad_y * 2
+        w = max(self._min_width, max_w + self._pad_x * 2)
+        self.rect.size = (w, h)
 
     def handle_event(self, event: pygame.event.Event) -> None:
         if not self.enabled:
@@ -91,12 +129,14 @@ class Button:
             if self.rect.collidepoint(event.pos):
                 self.on_click()
 
-    def draw(self, surface: pygame.Surface, font: pygame.font.Font) -> None:
+    def draw(self, surface: pygame.Surface) -> None:
         color = UI_BTN_HOVER if self.hovered and self.enabled else UI_BTN
         if not self.enabled:
             color = (45, 48, 55)
         pygame.draw.rect(surface, color, self.rect, border_radius=6)
-        text = font.render(self.current_label(), True, UI_FG if self.enabled else (100, 100, 100))
+        text = self._font.render(
+            self.current_label(), True, UI_FG if self.enabled else (100, 100, 100)
+        )
         tx = self.rect.x + (self.rect.w - text.get_width()) // 2
         ty = self.rect.y + (self.rect.h - text.get_height()) // 2
         surface.blit(text, (tx, ty))
@@ -168,21 +208,48 @@ class MazeApp:
         self.generate_new_maze()
 
     def _build_controls(self) -> None:
-        y = 0  # relative to controls strip; absolute set in draw
-        # Left cluster: action buttons
-        self.btn_new = Button(pygame.Rect(10, y, 100, 36), "New Maze", self.generate_new_maze)
+        y = 0  # relative to controls strip; absolute y set in draw
+        gap = 10
+        # Left cluster: action buttons, chained by measured widths
+        self.btn_new = Button(10, y, "New Maze", self.generate_new_maze, self.font, height=36)
         self.btn_start = Button(
-            pygame.Rect(120, y, 100, 36),
+            self.btn_new.rect.right + gap,
+            y,
             "Start",
             self.on_play_pause,
-            toggle_labels=("▶ Start", "⏸ Pause"),
+            self.font,
+            toggle_labels=("▶ Start", "Ⅱ Pause"),
+            height=36,
         )
-        self.btn_reset = Button(pygame.Rect(230, y, 80, 36), "Reset", self.reset_solving)
+        self.btn_reset = Button(
+            self.btn_start.rect.right + gap,
+            y,
+            "Reset",
+            self.reset_solving,
+            self.font,
+            height=36,
+        )
         self.btn_reset.enabled = False
-        # Explorer selector is drawn in _draw (wider, after Reset).
-        # Speed slider sits after the explorer block (see _draw for x).
-        self.slider = Slider(pygame.Rect(560, y + 8, 120, 20), 1, 100, 60)
-        self.buttons: List[Button] = [self.btn_new, self.btn_start, self.btn_reset]
+
+        # Explorer selector: width locked to the longest name so it doesn't jump
+        self.btn_explorer = Button(
+            self.btn_reset.rect.right + gap * 2,
+            y,
+            self.explorer_names[0],
+            lambda: self._cycle_explorer(1),
+            self.font,
+            size_labels=self.explorer_names,
+            height=36,
+        )
+
+        # Slider x is placed during draw after the explorer + arrows + Speed label
+        self.slider = Slider(pygame.Rect(0, y + 8, 120, 20), 1, 100, 60)
+        self.buttons: List[Button] = [
+            self.btn_new,
+            self.btn_start,
+            self.btn_reset,
+            self.btn_explorer,
+        ]
 
     def generate_new_maze(self) -> None:
         if self.engine is not None:
@@ -196,6 +263,7 @@ class MazeApp:
         self.btn_start.set_mode(0)
         self.btn_start.enabled = True
         self.btn_reset.enabled = False
+        self.btn_explorer.enabled = True
         self._resize_window()
 
     def _resize_window(self) -> None:
@@ -241,6 +309,7 @@ class MazeApp:
         self.state = SolveState.RUNNING
         self.btn_start.set_mode(1)
         self.btn_reset.enabled = True
+        self.btn_explorer.enabled = False
         self.engine.start(explorer)
 
     def reset_solving(self) -> None:
@@ -254,6 +323,7 @@ class MazeApp:
             self.status = f"Solving with: {name}"
             self.state = SolveState.RUNNING
             self.btn_start.set_mode(1)
+            self.btn_explorer.enabled = False
             self.engine.start(explorer)
         else:
             self.engine.reset_to_start()
@@ -261,6 +331,7 @@ class MazeApp:
             self.state = SolveState.IDLE
             self.btn_start.set_mode(0)
             self.btn_reset.enabled = False
+            self.btn_explorer.enabled = True
 
     def _on_goal_reached(self, move_count: int, path_length: int) -> None:
         # Called from the solver thread via the pending-goal mechanism;
@@ -273,6 +344,7 @@ class MazeApp:
         self.state = SolveState.IDLE
         self.btn_start.set_mode(0)
         self.btn_reset.enabled = False
+        self.btn_explorer.enabled = True
         self.status = (
             f"Solved! {self._goal_moves} moves attempted, "
             f"final path length {self._goal_path}."
@@ -284,6 +356,7 @@ class MazeApp:
             return
         n = len(self.explorer_names)
         self.selected_explorer = (self.selected_explorer + delta) % n
+        self.btn_explorer.set_label(self.explorer_names[self.selected_explorer])
 
     def run(self) -> None:
         running = True
@@ -305,10 +378,6 @@ class MazeApp:
                         self.generate_new_maze()
                     elif event.key == pygame.K_r:
                         self.reset_solving()
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    # Click on explorer label area to cycle
-                    if self._explorer_rect().collidepoint(event.pos):
-                        self._cycle_explorer(1)
                 for btn in self.buttons:
                     btn.handle_event(event)
                 if self.slider.handle_event(event):
@@ -338,14 +407,6 @@ class MazeApp:
             self.engine.stop_current()
         pygame.quit()
 
-    def _explorer_rect(self) -> pygame.Rect:
-        # Updated each frame in _draw; fall back to a safe rect before first draw.
-        return getattr(
-            self,
-            "_exp_rect",
-            pygame.Rect(320, self.screen.get_height() - self.controls_height + 10, 170, 36),
-        )
-
     def _draw(self) -> None:
         self.screen.fill(UI_BG)
         # Maze
@@ -360,43 +421,24 @@ class MazeApp:
             pygame.Rect(0, strip_y, self.screen.get_width(), self.controls_height),
         )
 
-        # Position buttons (New / Start / Reset) — fixed left cluster
-        for btn in self.buttons:
-            btn.rect.y = strip_y + 10
-            btn.draw(self.screen, self.font)
-
-        # ---- Sequential layout from measured text widths ----
         GAP = 8
         row_y = strip_y + 10
         text_y = strip_y + 18
-        x = self.btn_reset.rect.right + GAP * 2
 
-        # Explorer selector (clickable)
-        name = self.explorer_names[self.selected_explorer]
-        label = name if len(name) <= 22 else name[:20] + "…"
-        text = self.font.render(label, True, UI_FG)
-        pad_x = 14
-        exp_w = max(120, text.get_width() + pad_x * 2)
-        exp_h = 36
-        exp_rect = pygame.Rect(x, row_y, exp_w, exp_h)
-        self._exp_rect = exp_rect  # keep click target in sync
-        pygame.draw.rect(self.screen, UI_BTN, exp_rect, border_radius=6)
-        # Fit name inside the wider button
-        self.screen.blit(
-            text,
-            (
-                exp_rect.x + (exp_rect.w - text.get_width()) // 2,
-                exp_rect.y + (exp_rect.h - text.get_height()) // 2,
-            ),
-        )
-        x = exp_rect.right + GAP
+        # Action buttons + explorer (widths already measured at construction)
+        for btn in self.buttons:
+            btn.rect.y = row_y
+            btn.draw(self.screen)
 
-        # Arrow hints just to the right of the selector
+        # ---- Sequential layout for the remainder ----
+        x = self.btn_explorer.rect.right + GAP
+
+        # Arrow hints
         hint = self.font_status.render("◀ ▶", True, UI_STATUS)
         self.screen.blit(hint, (x, text_y))
         x += hint.get_width() + GAP * 2
 
-        # Speed label + slider — clear of the explorer block (ends ~520)
+        # "Speed" label
         spd = self.font_status.render("Speed", True, UI_STATUS)
         self.screen.blit(spd, (x, text_y))
         x += spd.get_width() + GAP
@@ -407,7 +449,7 @@ class MazeApp:
         self.slider.draw(self.screen)
         x = self.slider.rect.right + GAP * 2
 
-        # Status — after the slider
+        # Status
         status_surf = self.font_status.render(self.status, True, UI_STATUS)
         self.screen.blit(status_surf, (x, text_y))
 
