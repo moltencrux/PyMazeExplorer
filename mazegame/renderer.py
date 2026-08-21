@@ -100,8 +100,12 @@ class MazeRenderer:
         self._bump_phase = 0  # 0 = out, 1 = back
 
         # --- Exploration overlay ---
-        # cell -> monotonic time when first/last marked
+        # cell -> monotonic time when last marked (for fade timing)
         self._explored: Dict[Cell, float] = {}
+        # Cells still transitioning highlight → grey (per-frame updates only)
+        self._fading: Set[Cell] = set()
+        # Cached world-space overlay; fully-faded cells painted once and left
+        self.explore_surface: Optional[pygame.Surface] = None
         # ordered recent history (most recent last) — fallback for camera
         self._recent: Deque[Cell] = deque(maxlen=RECENT_N * 2)
         # Open leaves / frontier: cells that still have expansion work left.
@@ -162,8 +166,10 @@ class MazeRenderer:
         self.invalidate_trail()
         self._reset_sprite(start_cell)
         self._explored.clear()
+        self._fading.clear()
         self._recent.clear()
         self._frontier.clear()
+        self.explore_surface = None
         self.mark_explored(start_cell)
         # Cancel any in-flight animation.
         if self._anim_done is not None:
@@ -204,14 +210,19 @@ class MazeRenderer:
         now = time.monotonic()
         with self._explore_lock:
             self._explored[cell] = now
+            self._fading.add(cell)
             self._recent.append(cell)
+        self._paint_explored_cell(cell, HIGHLIGHT_COLOR)
 
     def mark_explored_many(self, cells: List[Cell]) -> None:
         now = time.monotonic()
         with self._explore_lock:
             for c in cells:
                 self._explored[c] = now
+                self._fading.add(c)
                 self._recent.append(c)
+        for c in cells:
+            self._paint_explored_cell(c, HIGHLIGHT_COLOR)
 
     def set_show_sprite(self, show: bool) -> None:
         """Show or hide the red agent dot."""
@@ -756,39 +767,59 @@ class MazeRenderer:
         # World-space centre of the camera
         world_cx = self.cam_x + self.pan_x
         world_cy = self.cam_y + self.pan_y
-        z = self.zoom
+        z = max(1e-6, self.zoom)
 
-        # Where the world origin lands on the screen
-        # screen_x = viewport.centerx + (world_x - world_cx) * z
+        # World-space rectangle visible in the viewport (plus 1px slack).
+        half_w = viewport.w / (2.0 * z)
+        half_h = viewport.h / (2.0 * z)
+        world_l = world_cx - half_w
+        world_t = world_cy - half_h
+        world_r = world_cx + half_w
+        world_b = world_cy + half_h
+
+        # Source rect on the full-maze surfaces (integer pixel bounds).
+        src_x = max(0, int(math.floor(world_l)) - 1)
+        src_y = max(0, int(math.floor(world_t)) - 1)
+        src_r = min(self.total_width, int(math.ceil(world_r)) + 1)
+        src_b = min(self.total_height, int(math.ceil(world_b)) + 1)
+        src_w = max(1, src_r - src_x)
+        src_h = max(1, src_b - src_y)
+
+        scaled_w = max(1, int(math.ceil(src_w * z)))
+        scaled_h = max(1, int(math.ceil(src_h * z)))
+
+        # Screen position of world (0,0); then of the source origin.
         ox = viewport.centerx - world_cx * z
         oy = viewport.centery - world_cy * z
+        dest_x = int(ox + src_x * z) - viewport.x
+        dest_y = int(oy + src_y * z) - viewport.y
 
-        # Build a temporary surface the size of the viewport and blit scaled pieces
-        # For simplicity and correctness we scale the whole maze surface.
-        # (Fine for the maze sizes we use; can be optimised later with dirty rects.)
-        scaled_w = max(1, int(self.total_width * z))
-        scaled_h = max(1, int(self.total_height * z))
-
-        # Clip: only the portion that intersects the viewport
-        # Destination top-left of the full scaled maze
-        dest_x = int(ox)
-        dest_y = int(oy)
-
-        # Create a sub-surface sized to the viewport
-        view_surf = pygame.Surface((viewport.w, viewport.h))
+        view_surf = surface.subsurface(viewport) if viewport.x == 0 and viewport.y == 0 and viewport.size == surface.get_size() else None
+        if view_surf is None:
+            # Draw into a clip region on the main surface when possible.
+            view_surf = pygame.Surface((viewport.w, viewport.h))
+            owns_view = True
+        else:
+            owns_view = False
         view_surf.fill(BG)
 
-        # Scale background + overlays once
-        bg_scaled = pygame.transform.scale(self.background, (scaled_w, scaled_h))
-        view_surf.blit(bg_scaled, (dest_x - viewport.x, dest_y - viewport.y))
+        # Scale only the visible slice of the background (not the whole maze).
+        bg_src = self.background.subsurface((src_x, src_y, src_w, src_h))
+        bg_scaled = pygame.transform.scale(bg_src, (scaled_w, scaled_h))
+        view_surf.blit(bg_scaled, (dest_x, dest_y))
 
-        # Exploration overlay (drawn under trail)
-        self._draw_exploration(view_surf, dest_x - viewport.x, dest_y - viewport.y, z)
+        # Exploration overlay (cached world surface; only fading cells update).
+        self._update_exploration_fade()
+        if self.explore_surface is not None:
+            exp_src = self.explore_surface.subsurface((src_x, src_y, src_w, src_h))
+            exp_scaled = pygame.transform.scale(exp_src, (scaled_w, scaled_h))
+            view_surf.blit(exp_scaled, (dest_x, dest_y))
 
         self._ensure_trail()
         if self.trail_surface is not None:
-            trail_scaled = pygame.transform.scale(self.trail_surface, (scaled_w, scaled_h))
-            view_surf.blit(trail_scaled, (dest_x - viewport.x, dest_y - viewport.y))
+            trail_src = self.trail_surface.subsurface((src_x, src_y, src_w, src_h))
+            trail_scaled = pygame.transform.scale(trail_src, (scaled_w, scaled_h))
+            view_surf.blit(trail_scaled, (dest_x, dest_y))
 
         # Debug: focus / frontier bounding box in world space
         if self.debug_camera and self._focus_box is not None:
@@ -809,37 +840,58 @@ class MazeRenderer:
                 pygame.draw.circle(view_surf, SPRITE_COLOR, (sx, sy), radius)
                 pygame.draw.circle(view_surf, WHITE, (sx, sy), radius, max(1, radius // 6))
 
-        surface.blit(view_surf, (viewport.x, viewport.y))
+        if owns_view:
+            surface.blit(view_surf, (viewport.x, viewport.y))
 
-    def _draw_exploration(
-        self, view_surf: pygame.Surface, origin_x: int, origin_y: int, z: float
-    ) -> None:
-        """Paint fading highlight for explored cells."""
+    def _ensure_explore_surface(self) -> None:
+        if self.explore_surface is not None:
+            return
+        if self.total_width <= 0 or self.total_height <= 0:
+            return
+        self.explore_surface = pygame.Surface(
+            (self.total_width, self.total_height), pygame.SRCALPHA
+        )
+
+    def _paint_explored_cell(self, cell: Cell, color: Tuple[int, int, int]) -> None:
+        self._ensure_explore_surface()
+        if self.explore_surface is None:
+            return
+        pad = max(1, ROOM_SIZE // 6)
+        x = self.col_x(cell.col) + pad
+        y = self.row_y(cell.row) + pad
+        w = self._cell_width(cell.col) - 2 * pad
+        h = self._cell_height(cell.row) - 2 * pad
+        if w <= 0 or h <= 0:
+            return
+        pygame.draw.rect(self.explore_surface, (*color, 255), (x, y, w, h))
+
+    def _update_exploration_fade(self) -> None:
+        """Advance highlight→grey only for cells still fading (not all visited)."""
         with self._explore_lock:
-            if not self._explored:
+            if not self._fading:
                 return
-            items = list(self._explored.items())
+            fading = list(self._fading)
+            explored = self._explored
+
         now = time.monotonic()
-        pad = max(1, int((ROOM_SIZE // 6) * z))
-
-        for cell, t0 in items:
+        done: List[Cell] = []
+        for cell in fading:
+            t0 = explored.get(cell)
+            if t0 is None:
+                done.append(cell)
+                continue
             age = now - t0
-            if age < 0:
-                continue
-            # intensity 1 → 0 over FADE_DURATION_S, then stays at grey
-            raw = 1.0 - min(1.0, age / FADE_DURATION_S)
-            # ease the fade a bit
-            intensity = raw * raw  # quadratic fall-off looks nicer
-            color = _lerp_color(EXPLORED_GREY, HIGHLIGHT_COLOR, intensity)
+            if age >= FADE_DURATION_S:
+                self._paint_explored_cell(cell, EXPLORED_GREY)
+                done.append(cell)
+            else:
+                raw = 1.0 - age / FADE_DURATION_S
+                intensity = raw * raw
+                color = _lerp_color(EXPLORED_GREY, HIGHLIGHT_COLOR, intensity)
+                self._paint_explored_cell(cell, color)
 
-            x = int(origin_x + self.col_x(cell.col) * z) + pad
-            y = int(origin_y + self.row_y(cell.row) * z) + pad
-            w = max(1, int(self._cell_width(cell.col) * z) - 2 * pad)
-            h = max(1, int(self._cell_height(cell.row) * z) - 2 * pad)
-            if w <= 0 or h <= 0:
-                continue
-            # Skip if completely outside the view surface
-            if x + w < 0 or y + h < 0 or x > view_surf.get_width() or y > view_surf.get_height():
-                continue
-            rect = pygame.Rect(x, y, w, h)
-            pygame.draw.rect(view_surf, color, rect, border_radius=max(2, int(4 * z)))
+        if done:
+            with self._explore_lock:
+                for c in done:
+                    self._fading.discard(c)
+
