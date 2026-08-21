@@ -737,9 +737,28 @@ class MazeRenderer:
             self._drag_last = event.pos
             return True
         if event.type == pygame.MOUSEWHEEL:
-            # Zoom toward cursor would be nicer; for now just scale
+            # Zoom by scaling the view rectangle about its centre.
+            # factor > 1 → zoom in (smaller world rect).
             factor = 1.12 if event.y > 0 else 1 / 1.12
-            self._target_zoom = max(0.15, min(2.0, self._target_zoom * factor))
+            cx = 0.5 * (self.view_left + self.view_right)
+            cy = 0.5 * (self.view_top + self.view_bottom)
+            w = (self.view_right - self.view_left) / factor
+            h = (self.view_bottom - self.view_top) / factor
+            # Respect MAX_ZOOM / fit-maze limits via resulting size.
+            min_w = self._last_viewport_w / max(MAX_ZOOM, 0.01)
+            max_w = float(self.total_width) * 1.01 if self.total_width > 0 else w
+            w = max(min_w, min(max_w, w))
+            aspect = self._last_viewport_w / max(1, self._last_viewport_h)
+            h = w / aspect
+            self.view_left = cx - w * 0.5
+            self.view_right = cx + w * 0.5
+            self.view_top = cy - h * 0.5
+            self.view_bottom = cy + h * 0.5
+            # Manual zoom temporarily overrides auto-follow; clear edge velocity.
+            self._vel_left = self._vel_right = self._vel_top = self._vel_bottom = 0.0
+            self._clamp_view_to_maze(self._last_viewport_w, self._last_viewport_h)
+            self._sync_cam_from_view(self._last_viewport_w, self._last_viewport_h)
+            self._scale_cache_key = None  # force rescale
             return True
         return False
 
