@@ -14,19 +14,30 @@ How it works:
   - Call can_move_up() / can_move_down() / can_move_left() / can_move_right()
     to test whether a move would succeed without actually performing it (no
     animation, no path change, no move count).
+  - Call teleport(cell) to jump instantly to a previously visited cell.
+    Returns True if the cell has been visited, False otherwise.
+  - Call has_visited(cell) to check whether a cell is in the visited set.
   - Call is_at_goal() to check if you've reached the goal.
   - Call get_hint() for a heuristic value (straight-line distance from your
     current square to the goal).
   - Call get_row() / get_col() to see where you currently are.
+  - Call mark_explored(cell) to highlight a cell in the exploration overlay
+    (optional; the engine already marks cells you step onto).
+  - Call set_show_sprite(False) to hide the red agent dot (useful for
+    frontier-style search where the highlight carries the visual).
+
+The camera automatically frames open leaves (visited cells that still have
+an unvisited open neighbour). Students do not need to manage that.
 
 You do NOT get direct access to the maze's wall layout. The only way to find
 out what's around you is to try moving (or call the can_move* helpers).
+Teleport only works for cells you have already stepped onto via move_*.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from .cell import Cell
 from .direction import Direction
@@ -83,6 +94,18 @@ class BaseExplorer(ABC):
     def can_move_right(self) -> bool:
         return self.can_move(Direction.RIGHT)
 
+    def teleport(self, cell: Cell) -> bool:
+        """
+        Jump to a previously visited cell.
+        Returns True if the teleport succeeded (cell was visited, or is the
+        current cell). Returns False if the cell has never been stepped on.
+        """
+        return self._require_engine().attempt_teleport(cell)
+
+    def has_visited(self, cell: Cell) -> bool:
+        """True if the explorer has previously stepped onto this cell."""
+        return self._require_engine().has_visited(cell)
+
     def get_hint(self) -> float:
         """Straight-line (Euclidean) distance to the goal. Smaller is closer."""
         return self._require_engine().get_hint()
@@ -101,3 +124,25 @@ class BaseExplorer(ABC):
 
     def get_move_count(self) -> int:
         return self._require_engine().get_move_count()
+
+    def mark_explored(self, cell: Optional[Cell] = None) -> None:
+        """
+        Highlight a cell in the exploration overlay.
+        If cell is None, marks the explorer's current position.
+        """
+        eng = self._require_engine()
+        if cell is None:
+            cell = Cell(eng.get_row(), eng.get_col())
+        eng.mark_explored(cell)
+
+    def mark_explored_many(self, cells: List[Cell]) -> None:
+        """Mark several cells at once."""
+        self._require_engine().mark_explored_many(cells)
+
+    def set_show_sprite(self, show: bool) -> None:
+        """
+        Show or hide the red agent dot.
+        Frontier-style algorithms (A*, Dijkstra, …) often hide it and rely
+        on the exploration highlight instead.
+        """
+        self._require_engine().set_show_sprite(show)

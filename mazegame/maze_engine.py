@@ -7,19 +7,18 @@ Threading model mirrors the Java version:
   - All mutable path / game-over state is mutated only on the main (render)
     thread via a request queue.
   - The explorer's solve() runs on a dedicated worker thread and calls
-    attempt_move(), which posts an animation request and blocks on an Event
-    until the animation finishes.
+    attempt_move() / attempt_teleport(), which post an animation request and
+    block on an Event until the animation finishes.
 """
 
 from __future__ import annotations
 
 import math
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Deque, List, Optional
+from typing import Callable, Deque, List, Optional, Set
 
 from .base_explorer import BaseExplorer
 from .cell import Cell
@@ -38,6 +37,7 @@ class MazeStoppedException(RuntimeError):
 class AnimKind(Enum):
     MOVE = auto()
     BUMP = auto()
+    TELEPORT = auto()
 
 
 @dataclass
@@ -56,6 +56,10 @@ class MazeEngine:
         self.maze = maze
         self.renderer = renderer
         self.path_stack: Deque[Cell] = deque([maze.start])
+        # Every cell the explorer has successfully stepped onto (or started on).
+        # teleport() is only allowed to these cells.
+        self.visited: Set[Cell] = {maze.start}
+        self.visited_open: Set[Cell] = {maze.start}
         self.move_count = 0
         self.game_over = False
         self.paused = False
@@ -66,6 +70,7 @@ class MazeEngine:
         self._lock = threading.Lock()
 
         renderer.set_engine_state(maze, list(self.path_stack), maze.start)
+        self._recompute_frontier()
 
     def set_goal_listener(self, listener: Callable[[int, int], None]) -> None:
         self._goal_listener = listener
@@ -107,10 +112,13 @@ class MazeEngine:
         self.stop_current()
         self.path_stack.clear()
         self.path_stack.append(self.maze.start)
+        self.visited = {self.maze.start}
+        self.visited_open = {self.maze.start}
         self.move_count = 0
         self.game_over = False
         self.paused = False
         self.renderer.set_engine_state(self.maze, list(self.path_stack), self.maze.start)
+        self._recompute_frontier()
 
     def start(self, explorer: BaseExplorer) -> None:
         self.reset_to_start()
@@ -121,7 +129,7 @@ class MazeEngine:
                 explorer.solve()
             except MazeStoppedException:
                 pass
-            except Exception as ex:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 print("Explorer threw an exception:")
                 import traceback
                 traceback.print_exc()
@@ -146,6 +154,31 @@ class MazeEngine:
         current = self.path_stack[-1]
         target = current.moved(direction)
         return self.maze.is_open_cell(target)
+
+    def has_visited(self, cell: Cell) -> bool:
+        return cell in self.visited
+
+
+    # instead of recomputing each time, what if when updated, we update
+    # frontier...
+
+    def _recompute_frontier(self) -> None:
+        """
+        Open leaves = visited cells that still have an unvisited open neighbour.
+        Derived from the maze + visited set so explorers never manage a frontier.
+        """
+        frontier: List[Cell] = []
+        dead_ends: Set[Cell] = set()
+        for cell in self.visited_open:
+            for direction in Direction:
+                neighbour = cell.moved(direction)
+                if self.maze.is_open_cell(neighbour) and neighbour not in self.visited:
+                    frontier.append(cell)
+                    break
+            else:
+                dead_ends.add(cell)
+        self.visited_open -= dead_ends
+        self.renderer.set_frontier(frontier)
 
     def attempt_move(self, direction: Direction) -> bool:
         if self.game_over or self._is_interrupted():
@@ -179,6 +212,11 @@ class MazeEngine:
         else:
             new_path = list(self.path_stack) + [target]
 
+        # Record visit and refresh open leaves for the camera.
+        self.visited.add(target)
+        self.visited_open.add(target)
+        self._recompute_frontier()
+
         done = threading.Event()
         req = AnimRequest(
             kind=AnimKind.MOVE,
@@ -200,6 +238,55 @@ class MazeEngine:
             path_len = len(new_path)
             self._pending_goal = (final_moves, path_len)
         return True
+
+    def attempt_teleport(self, cell: Cell) -> bool:
+        """
+        Instantly move the sprite to a previously visited cell.
+        Returns True on success, False if the cell has never been visited
+        (or is the current cell — treated as a no-op success).
+        """
+        if self.game_over or self._is_interrupted():
+            raise MazeStoppedException()
+        self._wait_if_paused()
+
+        current = self.path_stack[-1]
+        if cell == current:
+            return True
+
+        if cell not in self.visited:
+            return False
+
+        # Teleport does not count as a "move attempt" for the counter, but
+        # we still animate so the UI stays in sync.
+        new_path = [cell]
+        done = threading.Event()
+        req = AnimRequest(
+            kind=AnimKind.TELEPORT,
+            from_cell=current,
+            to_cell=cell,
+            direction=None,
+            done=done,
+            new_path=new_path,
+        )
+        with self._lock:
+            self._anim_queue.append(req)
+        self._await(done)
+
+        if cell == self.maze.goal:
+            self.game_over = True
+            self._pending_goal = (self.move_count, len(new_path))
+        return True
+
+    def mark_explored(self, cell: Cell) -> None:
+        """Explicitly mark a cell as explored (for frontier-style algorithms)."""
+        self.renderer.mark_explored(cell)
+
+    def mark_explored_many(self, cells: List[Cell]) -> None:
+        self.renderer.mark_explored_many(cells)
+
+    def set_show_sprite(self, show: bool) -> None:
+        """Show or hide the red agent sprite."""
+        self.renderer.set_show_sprite(show)
 
     def _await(self, event: threading.Event) -> None:
         while not event.wait(timeout=0.05):
@@ -233,8 +320,19 @@ class MazeEngine:
         if req.kind == AnimKind.MOVE and req.new_path is not None:
             self.path_stack = deque(req.new_path)
             self.renderer.update_path(req.new_path)
+            # Mark every cell we step onto (including backtracks) so the
+            # exploration overlay stays alive for sequential agents.
+            if req.to_cell is not None:
+                self.renderer.mark_explored(req.to_cell)
             assert req.to_cell is not None
             self.renderer.animate_move(req.from_cell, req.to_cell, req.done)
+        elif req.kind == AnimKind.TELEPORT and req.new_path is not None:
+            self.path_stack = deque(req.new_path)
+            self.renderer.update_path(req.new_path)
+            if req.to_cell is not None:
+                self.renderer.mark_explored(req.to_cell)
+            assert req.to_cell is not None
+            self.renderer.animate_teleport(req.from_cell, req.to_cell, req.done)
         elif req.kind == AnimKind.BUMP and req.direction is not None:
             self.renderer.animate_bump(req.from_cell, req.direction, req.done)
         else:

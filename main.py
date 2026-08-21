@@ -8,6 +8,9 @@ agent moving through the maze, leaves a trail behind it (which un-marks itself
 when the agent backtracks), and congratulates the player when the goal is
 reached.
 
+Supports larger mazes with a soft-follow camera driven by recent exploration
+and a fading exploration highlight overlay.
+
 Run:
     pip install pygame
     python main.py
@@ -22,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pygame
 
 from mazegame.base_explorer import BaseExplorer
-from mazegame.explorers import DFSExplorer, RandomWalkExplorer, WallFollowerExplorer
+from mazegame.explorers import AStarExplorer, DFSExplorer, RandomWalkExplorer, WallFollowerExplorer
 from mazegame.maze import Maze
 from mazegame.maze_engine import MazeEngine
 from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS
@@ -35,11 +38,17 @@ EXPLORERS: Dict[str, Callable[[], BaseExplorer]] = {
     "Random Walk (example)": RandomWalkExplorer,
     "Wall Follower (example)": WallFollowerExplorer,
     "DFS Explorer": DFSExplorer,
+    "A* Explorer": AStarExplorer,
     # EXPLORERS["My Algorithm"] = MyExplorer
 }
 
-DEFAULT_CELLS_WIDE = 36
-DEFAULT_CELLS_HIGH = 28
+# Larger default so the camera / exploration overlay has room to work.
+DEFAULT_CELLS_WIDE = 72
+DEFAULT_CELLS_HIGH = 54
+
+# Preferred window size (maze is scrolled inside the viewport above controls)
+WINDOW_W = 1280
+WINDOW_H = 800
 
 # UI colours
 UI_BG = (40, 44, 52)
@@ -170,23 +179,7 @@ class Slider:
         self.value = int(self.min_v + t * (self.max_v - self.min_v))
 
     def draw(self, surface: pygame.Surface) -> None:
-        label_color = (220, 220, 220)
-
-        # Labels above the bar, aligned with its left and right edges.
-        minus_label = self.font.render("-", True, label_color)
-        plus_label = self.font.render("+", True, label_color)
-
-        minus_rect = minus_label.get_rect(
-            left=self.rect.left, bottom=self.rect.top + 5
-        )
-        plus_rect = plus_label.get_rect(
-            right=self.rect.right, bottom=self.rect.top + 5
-        )
-
-        surface.blit(minus_label, minus_rect)
-        surface.blit(plus_label, plus_rect)
-
-        # Track
+        # track
         mid_y = self.rect.centery
         pygame.draw.line(
             surface, (100, 110, 130),
@@ -219,8 +212,7 @@ class MazeApp:
         self._goal_path = 0
 
         self.controls_height = 56
-        # Initial size; will resize after first maze
-        self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
+        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
         self._build_controls()
         self.generate_new_maze()
 
@@ -276,25 +268,16 @@ class MazeApp:
         self.engine.set_goal_listener(self._on_goal_reached)
         self.apply_speed()
         self.state = SolveState.IDLE
-        self.status = "New maze ready. Pick an explorer and press Start."
+        self.status = "New maze ready. Pick an explorer and press Start.  (drag to pan, wheel to zoom)"
         self.btn_start.set_mode(0)
         self.btn_start.enabled = True
         self.btn_reset.enabled = False
         self.btn_explorer.enabled = True
-        self._resize_window()
-
-    def _resize_window(self) -> None:
-        if self.renderer.total_width == 0:
-            return
-        w = max(700, self.renderer.total_width + 40)
-        h = self.renderer.total_height + self.controls_height + 40
-        self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+        self.renderer.reset_pan()
 
     def apply_speed(self) -> None:
         # Slider 1..100 → animation duration ~ 300 ms (slow) down to ~ 0 ms (fast)
-        # Same mapping idea as the Java slider.
         v = self.slider.value
-        # high slider = faster → shorter duration
         duration = int(300 * (100 - v) / 99)
         if self.engine is not None:
             self.engine.set_animation_duration_ms(duration)
@@ -349,6 +332,7 @@ class MazeApp:
             self.btn_start.set_mode(0)
             self.btn_reset.enabled = False
             self.btn_explorer.enabled = True
+            self.renderer.reset_pan()
 
     def _on_goal_reached(self, move_count: int, path_length: int) -> None:
         # Called from the solver thread via the pending-goal mechanism;
@@ -375,10 +359,20 @@ class MazeApp:
         self.selected_explorer = (self.selected_explorer + delta) % n
         self.btn_explorer.set_label(self.explorer_names[self.selected_explorer])
 
+    def _viewport(self) -> pygame.Rect:
+        """Area available for the maze (everything above the controls strip)."""
+        return pygame.Rect(
+            0, 0,
+            self.screen.get_width(),
+            max(1, self.screen.get_height() - self.controls_height),
+        )
+
     def run(self) -> None:
         running = True
         while running:
             dt = self.clock.tick(60)
+            dt_s = dt / 1000.0
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -395,6 +389,23 @@ class MazeApp:
                         self.generate_new_maze()
                     elif event.key == pygame.K_r:
                         self.reset_solving()
+                    elif event.key == pygame.K_c:
+                        # centre / clear manual pan
+                        self.renderer.reset_pan()
+
+                # Pan / zoom only when the pointer is over the maze viewport
+                vp = self._viewport()
+                if event.type in (
+                    pygame.MOUSEBUTTONDOWN,
+                    pygame.MOUSEBUTTONUP,
+                    pygame.MOUSEMOTION,
+                    pygame.MOUSEWHEEL,
+                ):
+                    pos = getattr(event, "pos", None)
+                    if pos is None or vp.collidepoint(pos) or event.type == pygame.MOUSEWHEEL:
+                        if self.renderer.handle_pan_event(event):
+                            continue  # consumed by camera
+
                 for btn in self.buttons:
                     btn.handle_event(event)
                 if self.slider.handle_event(event):
@@ -412,6 +423,10 @@ class MazeApp:
                 if not self.renderer.is_animating():
                     self.renderer.update_path(list(self.engine.path_stack))
 
+                # Soft-follow camera driven by recent exploration
+                vp = self._viewport()
+                self.renderer.update_camera(vp.w, vp.h, dt_s)
+
             if self._show_goal_dialog:
                 self._finish_goal()
                 # Simple status update; a full modal is overkill for pygame.
@@ -426,10 +441,10 @@ class MazeApp:
 
     def _draw(self) -> None:
         self.screen.fill(UI_BG)
-        # Maze
-        maze_x = max(0, (self.screen.get_width() - self.renderer.total_width) // 2)
-        maze_y = 10
-        self.renderer.draw(self.screen, (maze_x, maze_y))
+
+        # Maze viewport
+        vp = self._viewport()
+        self.renderer.draw(self.screen, vp)
 
         # Controls strip
         strip_y = self.screen.get_height() - self.controls_height
