@@ -253,6 +253,7 @@ class MazeApp:
 
         # Slider x is placed during draw after the explorer + arrows + Speed label
         self.slider = Slider(pygame.Rect(0, y + 8, 120, 20), 1, 100, 60)
+        self._anim_batch = 1  # steps processed per frame at high speed
         self.buttons: List[Button] = [
             self.btn_new,
             self.btn_start,
@@ -276,9 +277,20 @@ class MazeApp:
         self.renderer.reset_pan()
 
     def apply_speed(self) -> None:
-        # Slider 1..100 → animation duration ~ 300 ms (slow) down to ~ 0 ms (fast)
+        """
+        Slider 1..100:
+          1..70  → animated moves, ~400 ms down to ~0 ms per step
+          71..100 → instant moves, batch 1..30 steps per frame (faster than 60 Hz)
+        """
         v = self.slider.value
-        duration = int(300 * (100 - v) / 99)
+        if v <= 70:
+            # 1 → 400ms, 70 → 0ms
+            duration = int(400 * (70 - v) / 69) if v < 70 else 0
+            self._anim_batch = 1
+        else:
+            # 71 → batch 2, 100 → batch 30
+            duration = 0
+            self._anim_batch = 2 + int((v - 71) * 28 / 29)
         if self.engine is not None:
             self.engine.set_animation_duration_ms(duration)
 
@@ -421,15 +433,17 @@ class MazeApp:
                 if self.slider.handle_event(event):
                     self.apply_speed()
 
-            # Engine / animation
+            # Engine / animation — at high speed, drain several instant steps per frame
             if self.engine is not None:
-                goal = self.engine.poll()
-                if goal is not None:
-                    self._goal_moves, self._goal_path = goal
-                    self._show_goal_dialog = True
-                self.renderer.tick(dt)
-                # Keep path in sync for trail (skip while animating so we
-                # don't fight the trail-cache rebuild timing).
+                batch = max(1, getattr(self, "_anim_batch", 1))
+                for _ in range(batch):
+                    goal = self.engine.poll()
+                    if goal is not None:
+                        self._goal_moves, self._goal_path = goal
+                        self._show_goal_dialog = True
+                    self.renderer.tick(dt if _ == 0 else 0)
+                    if self.renderer.is_animating():
+                        break  # mid-animation; wait for more frames
                 if not self.renderer.is_animating():
                     self.renderer.update_path(list(self.engine.path_stack))
 
