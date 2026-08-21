@@ -486,46 +486,46 @@ class MazeRenderer:
 
         if self.overview_mode:
             # Frame the entire maze (for debugging / orientation).
+            self._focus_box = (0.0, 0.0, float(self.total_width), float(self.total_height))
             self._target_cam_x = self.total_width / 2.0
             self._target_cam_y = self.total_height / 2.0
-            margin = 1.02
-            zx = viewport_w / max(1.0, self.total_width * margin)
-            zy = viewport_h / max(1.0, self.total_height * margin)
-            self._target_zoom = max(0.05, min(zx, zy))
-            self._focus_box = (0.0, 0.0, float(self.total_width), float(self.total_height))
-        elif not focus_cells:
-            self._target_cam_x = self.sprite_x
-            self._target_cam_y = self.sprite_y
-            init_box = ROOM_SIZE * max(MIN_VIEW_CELLS, 12)
-            target_zoom = min(viewport_w / init_box, viewport_h / init_box, 1.35)
-            self._target_zoom = max(0.08, target_zoom)
-            pad = ROOM_SIZE * PADDING_CELLS
-            self._focus_box = (
-                self.sprite_x - pad,
-                self.sprite_y - pad,
-                self.sprite_x + pad,
-                self.sprite_y + pad,
-            )
+            self._target_zoom = self._min_zoom_to_fit_maze(viewport_w, viewport_h)
         else:
-            min_x = min_y = float("inf")
-            max_x = max_y = float("-inf")
-            for cell in focus_cells:
-                px, py = self._cell_center(cell)
-                half_w = self._cell_width(cell.col) * 0.5 + ROOM_SIZE * PADDING_CELLS
-                half_h = self._cell_height(cell.row) * 0.5 + ROOM_SIZE * PADDING_CELLS
-                min_x = min(min_x, px - half_w)
-                max_x = max(max_x, px + half_w)
-                min_y = min(min_y, py - half_h)
-                max_y = max(max_y, py + half_h)
+            # --- Build focus box (frontier / recent / sprite) ---
+            if not focus_cells:
+                pad = ROOM_SIZE * PADDING_CELLS
+                min_x = self.sprite_x - pad
+                max_x = self.sprite_x + pad
+                min_y = self.sprite_y - pad
+                max_y = self.sprite_y + pad
+            else:
+                min_x = min_y = float("inf")
+                max_x = max_y = float("-inf")
+                for cell in focus_cells:
+                    px, py = self._cell_center(cell)
+                    half_w = self._cell_width(cell.col) * 0.5 + ROOM_SIZE * PADDING_CELLS
+                    half_h = self._cell_height(cell.row) * 0.5 + ROOM_SIZE * PADDING_CELLS
+                    min_x = min(min_x, px - half_w)
+                    max_x = max(max_x, px + half_w)
+                    min_y = min(min_y, py - half_h)
+                    max_y = max(max_y, py + half_h)
 
-            # Always include the sprite so the active agent/start cannot fall
-            # outside the framed rectangle (important at the beginning and for
-            # sequential explorers).
-            pad = ROOM_SIZE * PADDING_CELLS
-            min_x = min(min_x, self.sprite_x - pad)
-            max_x = max(max_x, self.sprite_x + pad)
-            min_y = min(min_y, self.sprite_y - pad)
-            max_y = max(max_y, self.sprite_y + pad)
+                # Always include the sprite so the active agent cannot fall out.
+                pad = ROOM_SIZE * PADDING_CELLS
+                min_x = min(min_x, self.sprite_x - pad)
+                max_x = max(max_x, self.sprite_x + pad)
+                min_y = min(min_y, self.sprite_y - pad)
+                max_y = max(max_y, self.sprite_y + pad)
+
+            # Clip the focus box to the maze — nothing outside is meaningful.
+            min_x = max(0.0, min_x)
+            min_y = max(0.0, min_y)
+            max_x = min(float(self.total_width), max_x)
+            max_y = min(float(self.total_height), max_y)
+            if max_x < min_x:
+                min_x, max_x = max_x, min_x
+            if max_y < min_y:
+                min_y, max_y = max_y, min_y
 
             self._focus_box = (min_x, min_y, max_x, max_y)
 
@@ -533,24 +533,32 @@ class MazeRenderer:
             # so a lopsided cluster cannot push the sparse side off-screen.
             cx = (min_x + max_x) / 2.0
             cy = (min_y + max_y) / 2.0
-
             box_w = max(max_x - min_x, ROOM_SIZE * MIN_VIEW_CELLS)
             box_h = max(max_y - min_y, ROOM_SIZE * MIN_VIEW_CELLS)
 
-            # Zoom so the box roughly fits the viewport (with a little margin)
-            zoom_x = viewport_w / box_w
-            zoom_y = viewport_h / box_h
-            target_zoom = min(zoom_x, zoom_y, 1.35)
-            target_zoom = max(0.05, target_zoom)
+            # Ideal zoom to fit the box if we could centre freely.
+            fit_zoom = min(viewport_w / box_w, viewport_h / box_h, 1.35)
+            fit_zoom = max(0.05, fit_zoom)
 
+            # Clamp the centre at that zoom so we never show empty space past
+            # the maze edge. That can shift the centre *inward* near corners.
+            cx, cy = self._clamp_center(cx, cy, viewport_w, viewport_h, fit_zoom)
+
+            # After the centre has moved, the original fit_zoom may no longer
+            # cover the box (e.g. left leaf falls off while we pan right to
+            # respect the left maze edge). Zoom out until the box is covered
+            # from the clamped centre.
+            self._target_zoom = self._zoom_to_cover_box(
+                cx, cy, min_x, min_y, max_x, max_y, viewport_w, viewport_h, fit_zoom
+            )
+            # Re-clamp centre at the *final* zoom (half-extents changed).
+            cx, cy = self._clamp_center(cx, cy, viewport_w, viewport_h, self._target_zoom)
+            # One more cover pass in case the second clamp moved us again.
+            self._target_zoom = self._zoom_to_cover_box(
+                cx, cy, min_x, min_y, max_x, max_y, viewport_w, viewport_h, self._target_zoom
+            )
             self._target_cam_x = cx
             self._target_cam_y = cy
-            self._target_zoom = target_zoom
-
-        # Keep the *target* inside the maze so the spring never aims off-map.
-        self._target_cam_x, self._target_cam_y = self._clamp_center(
-            self._target_cam_x, self._target_cam_y, viewport_w, viewport_h, self._target_zoom
-        )
 
         if self._snap_camera:
             # Hard cut used after new maze / reset so the start is on-screen
@@ -585,6 +593,49 @@ class MazeRenderer:
     ) -> Tuple[float, float]:
         z = max(0.01, zoom)
         return viewport_w / (2.0 * z), viewport_h / (2.0 * z)
+
+    def _min_zoom_to_fit_maze(self, viewport_w: int, viewport_h: int) -> float:
+        """Most zoomed-out level that still has the maze touching the viewport
+        on at least one axis — never show empty gutters on *both* sides of an axis
+        by zooming out past the full maze."""
+        if self.total_width <= 0 or self.total_height <= 0:
+            return 0.05
+        # Slight margin so the outer wall isn't clipped by rounding.
+        margin = 1.01
+        zx = viewport_w / (self.total_width * margin)
+        zy = viewport_h / (self.total_height * margin)
+        return max(0.05, min(zx, zy))
+
+    def _zoom_to_cover_box(
+        self,
+        cx: float,
+        cy: float,
+        min_x: float,
+        min_y: float,
+        max_x: float,
+        max_y: float,
+        viewport_w: int,
+        viewport_h: int,
+        current_zoom: float,
+    ) -> float:
+        """
+        Return a zoom level at which the axis-aligned box is fully visible
+        when the view is centred on (cx, cy). Only zooms *out* relative to
+        current_zoom (never in past the caller's preferred fit).
+        """
+        # Distance from centre to the farther horizontal / vertical edge of the box.
+        need_half_w = max(abs(cx - min_x), abs(max_x - cx), 1.0)
+        need_half_h = max(abs(cy - min_y), abs(max_y - cy), 1.0)
+        # z such that viewport_w/(2z) >= need_half_w  →  z <= viewport_w/(2*need_half_w)
+        z_w = viewport_w / (2.0 * need_half_w)
+        z_h = viewport_h / (2.0 * need_half_h)
+        cover_zoom = min(z_w, z_h)
+        # Prefer the caller's zoom when it already covers; otherwise zoom out.
+        z = min(current_zoom, cover_zoom)
+        z = min(z, 1.35)
+        # Floor: do not zoom out further than "entire maze in view".
+        z = max(z, self._min_zoom_to_fit_maze(viewport_w, viewport_h))
+        return z
 
     def _clamp_center(
         self,
