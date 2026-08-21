@@ -77,8 +77,6 @@ class MazeRenderer:
     def __init__(self) -> None:
         self.maze: Optional[Maze] = None
         self.path: List[Cell] = []
-        self.col_x: List[int] = []
-        self.row_y: List[int] = []
         self.total_width = 0
         self.total_height = 0
         self.background: Optional[pygame.Surface] = None
@@ -238,33 +236,32 @@ class MazeRenderer:
     # Geometry (variable thickness)
     # ------------------------------------------------------------------
 
-    def _rebuild_geometry(self) -> None:
-        assert self.maze is not None
-        cols, rows = self.maze.cols, self.maze.rows
-        self.col_x = [0] * (cols + 1)
-        self.row_y = [0] * (rows + 1)
-        for c in range(cols):
-            w = WALL_THICKNESS if c % 2 == 0 else ROOM_SIZE
-            self.col_x[c + 1] = self.col_x[c] + w
-        self.total_width = self.col_x[cols]
-        for r in range(rows):
-            h = WALL_THICKNESS if r % 2 == 0 else ROOM_SIZE
-            self.row_y[r + 1] = self.row_y[r] + h
-        self.total_height = self.row_y[rows]
-
-    # not used yet, but could do something like this for dynamic geometry
-    def _cum_col_x(col):
+    @staticmethod
+    def col_x(col: int) -> int:
+        """World-pixel left edge of column *col* (variable-thickness grid)."""
         return (col // 2) * (WALL_THICKNESS + ROOM_SIZE) + WALL_THICKNESS * (col % 2)
 
-    def _cell_width(self, col: int) -> int:
-        return self.col_x[col + 1] - self.col_x[col]
+    @staticmethod
+    def row_y(row: int) -> int:
+        """World-pixel top edge of row *row* (variable-thickness grid)."""
+        return (row // 2) * (WALL_THICKNESS + ROOM_SIZE) + WALL_THICKNESS * (row % 2)
 
-    def _cell_height(self, row: int) -> int:
-        return self.row_y[row + 1] - self.row_y[row]
+    def _rebuild_geometry(self) -> None:
+        assert self.maze is not None
+        self.total_width = self.col_x(self.maze.cols)
+        self.total_height = self.row_y(self.maze.rows)
+
+    @staticmethod
+    def _cell_width(col: int) -> int:
+        return WALL_THICKNESS if col % 2 == 0 else ROOM_SIZE
+
+    @staticmethod
+    def _cell_height(row: int) -> int:
+        return WALL_THICKNESS if row % 2 == 0 else ROOM_SIZE
 
     def _cell_center(self, cell: Cell) -> Tuple[float, float]:
-        x = self.col_x[cell.col] + self._cell_width(cell.col) / 2.0
-        y = self.row_y[cell.row] + self._cell_height(cell.row) / 2.0
+        x = self.col_x(cell.col) + self._cell_width(cell.col) / 2.0
+        y = self.row_y(cell.row) + self._cell_height(cell.row) / 2.0
         return x, y
 
     def _rebuild_background(self) -> None:
@@ -276,8 +273,8 @@ class MazeRenderer:
                 open_ = self.maze.is_open(r, c)
                 color = OPEN_COLOR if open_ else WALL_COLOR
                 rect = pygame.Rect(
-                    self.col_x[c],
-                    self.row_y[r],
+                    self.col_x(c),
+                    self.row_y(r),
                     self._cell_width(c),
                     self._cell_height(r),
                 )
@@ -290,16 +287,16 @@ class MazeRenderer:
         self, surf: pygame.Surface, cell: Cell, color: Tuple[int, int, int], label: str
     ) -> None:
         pad = max(2, ROOM_SIZE // 8)
-        x = self.col_x[cell.col] + pad
-        y = self.row_y[cell.row] + pad
+        x = self.col_x(cell.col) + pad
+        y = self.row_y(cell.row) + pad
         w = self._cell_width(cell.col) - 2 * pad
         h = self._cell_height(cell.row) - 2 * pad
         rect = pygame.Rect(x, y, w, h)
         pygame.draw.rect(surf, color, rect, border_radius=6)
         font = pygame.font.SysFont("sans", max(12, ROOM_SIZE // 2), bold=True)
         text = font.render(label, True, WHITE)
-        tx = self.col_x[cell.col] + (self._cell_width(cell.col) - text.get_width()) // 2
-        ty = self.row_y[cell.row] + (self._cell_height(cell.row) - text.get_height()) // 2
+        tx = self.col_x(cell.col) + (self._cell_width(cell.col) - text.get_width()) // 2
+        ty = self.row_y(cell.row) + (self._cell_height(cell.row) - text.get_height()) // 2
         surf.blit(text, (tx, ty))
 
     def _ensure_trail(self) -> None:
@@ -311,8 +308,8 @@ class MazeRenderer:
             if idx == 0:
                 continue  # skip current (head) cell
             rect = pygame.Rect(
-                self.col_x[c.col] + pad,
-                self.row_y[c.row] + pad,
+                self.col_x(c.col) + pad,
+                self.row_y(c.row) + pad,
                 self._cell_width(c.col) - 2 * pad,
                 self._cell_height(c.row) - 2 * pad,
             )
@@ -622,6 +619,7 @@ class MazeRenderer:
         Return a zoom level at which the axis-aligned box is fully visible
         when the view is centred on (cx, cy). Only zooms *out* relative to
         current_zoom (never in past the caller's preferred fit).
+        Never zooms out past fitting the entire maze (avoids white gutters).
         """
         # Distance from centre to the farther horizontal / vertical edge of the box.
         need_half_w = max(abs(cx - min_x), abs(max_x - cx), 1.0)
@@ -835,8 +833,8 @@ class MazeRenderer:
             intensity = raw * raw  # quadratic fall-off looks nicer
             color = _lerp_color(EXPLORED_GREY, HIGHLIGHT_COLOR, intensity)
 
-            x = int(origin_x + self.col_x[cell.col] * z) + pad
-            y = int(origin_y + self.row_y[cell.row] * z) + pad
+            x = int(origin_x + self.col_x(cell.col) * z) + pad
+            y = int(origin_y + self.row_y(cell.row) * z) + pad
             w = max(1, int(self._cell_width(cell.col) * z) - 2 * pad)
             h = max(1, int(self._cell_height(cell.row) * z) - 2 * pad)
             if w <= 0 or h <= 0:
