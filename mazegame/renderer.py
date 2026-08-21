@@ -134,6 +134,11 @@ class MazeRenderer:
         self._snap_camera = True
         self._last_viewport_w = 800
         self._last_viewport_h = 600
+        # Debug: last focus bounding box in world pixels (min_x, min_y, max_x, max_y)
+        self._focus_box: Optional[Tuple[float, float, float, float]] = None
+        self.debug_camera = False
+        # When True, frame the entire maze instead of the frontier box
+        self.overview_mode = False
 
     # ------------------------------------------------------------------
     # Public API used by engine / main
@@ -479,12 +484,28 @@ class MazeRenderer:
         self._last_viewport_w = viewport_w
         self._last_viewport_h = viewport_h
 
-        if not focus_cells:
+        if self.overview_mode:
+            # Frame the entire maze (for debugging / orientation).
+            self._target_cam_x = self.total_width / 2.0
+            self._target_cam_y = self.total_height / 2.0
+            margin = 1.02
+            zx = viewport_w / max(1.0, self.total_width * margin)
+            zy = viewport_h / max(1.0, self.total_height * margin)
+            self._target_zoom = max(0.05, min(zx, zy))
+            self._focus_box = (0.0, 0.0, float(self.total_width), float(self.total_height))
+        elif not focus_cells:
             self._target_cam_x = self.sprite_x
             self._target_cam_y = self.sprite_y
             init_box = ROOM_SIZE * max(MIN_VIEW_CELLS, 12)
             target_zoom = min(viewport_w / init_box, viewport_h / init_box, 1.35)
-            self._target_zoom = max(0.22, target_zoom)
+            self._target_zoom = max(0.08, target_zoom)
+            pad = ROOM_SIZE * PADDING_CELLS
+            self._focus_box = (
+                self.sprite_x - pad,
+                self.sprite_y - pad,
+                self.sprite_x + pad,
+                self.sprite_y + pad,
+            )
         else:
             min_x = min_y = float("inf")
             max_x = max_y = float("-inf")
@@ -506,6 +527,8 @@ class MazeRenderer:
             min_y = min(min_y, self.sprite_y - pad)
             max_y = max(max_y, self.sprite_y + pad)
 
+            self._focus_box = (min_x, min_y, max_x, max_y)
+
             # Centre of the frontier bounding box (not the centroid of points),
             # so a lopsided cluster cannot push the sparse side off-screen.
             cx = (min_x + max_x) / 2.0
@@ -518,7 +541,7 @@ class MazeRenderer:
             zoom_x = viewport_w / box_w
             zoom_y = viewport_h / box_h
             target_zoom = min(zoom_x, zoom_y, 1.35)
-            target_zoom = max(0.22, target_zoom)
+            target_zoom = max(0.05, target_zoom)
 
             self._target_cam_x = cx
             self._target_cam_y = cy
@@ -656,6 +679,19 @@ class MazeRenderer:
         self.pan_x = 0.0
         self.pan_y = 0.0
 
+    def toggle_debug_camera(self) -> bool:
+        self.debug_camera = not self.debug_camera
+        return self.debug_camera
+
+    def toggle_overview(self) -> bool:
+        """Zoom out to the full maze (or resume frontier framing)."""
+        self.overview_mode = not self.overview_mode
+        if self.overview_mode:
+            self.pan_x = 0.0
+            self.pan_y = 0.0
+            self._snap_camera = True  # jump so the whole maze is visible immediately
+        return self.overview_mode
+
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
@@ -705,6 +741,16 @@ class MazeRenderer:
         if self.trail_surface is not None:
             trail_scaled = pygame.transform.scale(self.trail_surface, (scaled_w, scaled_h))
             view_surf.blit(trail_scaled, (dest_x - viewport.x, dest_y - viewport.y))
+
+        # Debug: focus / frontier bounding box in world space
+        if self.debug_camera and self._focus_box is not None:
+            min_x, min_y, max_x, max_y = self._focus_box
+            # Same transform as the scaled maze blit
+            rx = int(ox + min_x * z) - viewport.x
+            ry = int(oy + min_y * z) - viewport.y
+            rw = max(1, int((max_x - min_x) * z))
+            rh = max(1, int((max_y - min_y) * z))
+            pygame.draw.rect(view_surf, (255, 64, 255), pygame.Rect(rx, ry, rw, rh), width=2)
 
         # Sprite (optional — frontier explorers often hide it)
         if self.show_sprite:

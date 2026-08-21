@@ -268,7 +268,7 @@ class MazeApp:
         self.engine.set_goal_listener(self._on_goal_reached)
         self.apply_speed()
         self.state = SolveState.IDLE
-        self.status = "New maze ready. Pick an explorer and press Start.  (drag to pan, wheel to zoom)"
+        self.status = "New maze ready. Pick an explorer and press Start.  (drag/wheel pan·zoom, D debug box, F overview)"
         self.btn_start.set_mode(0)
         self.btn_start.enabled = True
         self.btn_reset.enabled = False
@@ -392,6 +392,16 @@ class MazeApp:
                     elif event.key == pygame.K_c:
                         # centre / clear manual pan
                         self.renderer.reset_pan()
+                    elif event.key == pygame.K_d:
+                        on = self.renderer.toggle_debug_camera()
+                        self.status = f"Camera debug bbox {'ON' if on else 'OFF'} (magenta)."
+                    elif event.key == pygame.K_f:
+                        on = self.renderer.toggle_overview()
+                        self.status = (
+                            "Overview: full maze."
+                            if on
+                            else "Overview off — frontier framing resumed."
+                        )
 
                 # Pan / zoom only when the pointer is over the maze viewport
                 vp = self._viewport()
