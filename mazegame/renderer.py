@@ -106,6 +106,11 @@ class MazeRenderer:
         self._fading: Set[Cell] = set()
         # Cached world-space overlay; fully-faded cells painted once and left
         self.explore_surface: Optional[pygame.Surface] = None
+        # Last scaled visible slices (reuse when camera/zoom unchanged)
+        self._scale_cache_key: Optional[tuple] = None
+        self._bg_scaled: Optional[pygame.Surface] = None
+        self._exp_scaled: Optional[pygame.Surface] = None
+        self._trail_scaled: Optional[pygame.Surface] = None
         # ordered recent history (most recent last) — fallback for camera
         self._recent: Deque[Cell] = deque(maxlen=RECENT_N * 2)
         # Open leaves / frontier: cells that still have expansion work left.
@@ -170,6 +175,8 @@ class MazeRenderer:
         self._recent.clear()
         self._frontier.clear()
         self.explore_surface = None
+        self._scale_cache_key = None
+        self._bg_scaled = self._exp_scaled = self._trail_scaled = None
         self.mark_explored(start_cell)
         # Cancel any in-flight animation.
         if self._anim_done is not None:
@@ -200,6 +207,7 @@ class MazeRenderer:
     def invalidate_trail(self) -> None:
         self.trail_surface = None
         self.trail_path_size = -1
+        self._trail_scaled = None  # force rescale next draw
 
     def update_path(self, path: List[Cell]) -> None:
         self.path = list(path)
@@ -312,9 +320,9 @@ class MazeRenderer:
         ty = self.row_y(cell.row) + (self._cell_height(cell.row) - text.get_height()) // 2
         surf.blit(text, (tx, ty))
 
-    def _ensure_trail(self) -> None:
+    def _ensure_trail(self) -> bool:
         if self.trail_surface is not None and self.trail_path_size == len(self.path):
-            return
+            return False
         surf = pygame.Surface((self.total_width, self.total_height), pygame.SRCALPHA)
         pad = max(2, ROOM_SIZE // 6)
         for idx, c in enumerate(self.path):
@@ -328,6 +336,7 @@ class MazeRenderer:
             )
             pygame.draw.rect(surf, TRAIL_COLOR, rect, border_radius=6)
         self.trail_surface = surf
+        return True
         self.trail_path_size = len(self.path)
 
     def _reset_sprite(self, cell: Cell) -> None:
@@ -803,25 +812,32 @@ class MazeRenderer:
             owns_view = False
         view_surf.fill(BG)
 
-        # Scale only the visible slice of the background (not the whole maze).
-        bg_src = self.background.subsurface((src_x, src_y, src_w, src_h))
-        bg_scaled = pygame.transform.scale(bg_src, (scaled_w, scaled_h))
-        view_surf.blit(bg_scaled, (dest_x, dest_y))
+        # Scale only the visible slice; reuse when the view rect + zoom are unchanged.
+        cache_key = (src_x, src_y, src_w, src_h, scaled_w, scaled_h)
+        need_rescale = cache_key != self._scale_cache_key
 
-        # Exploration overlay (cached world surface; only fading cells update).
-        self._update_exploration_fade()
+        if need_rescale or self._bg_scaled is None:
+            bg_src = self.background.subsurface((src_x, src_y, src_w, src_h))
+            self._bg_scaled = pygame.transform.scale(bg_src, (scaled_w, scaled_h))
+        view_surf.blit(self._bg_scaled, (dest_x, dest_y))
+
+        # Exploration: update fade paints, then scale only if view changed or fade painted.
+        fading_active = self._update_exploration_fade()
         if self.explore_surface is not None:
-            exp_src = self.explore_surface.subsurface((src_x, src_y, src_w, src_h))
-            exp_scaled = pygame.transform.scale(exp_src, (scaled_w, scaled_h))
-            view_surf.blit(exp_scaled, (dest_x, dest_y))
+            if need_rescale or fading_active or self._exp_scaled is None:
+                exp_src = self.explore_surface.subsurface((src_x, src_y, src_w, src_h))
+                self._exp_scaled = pygame.transform.scale(exp_src, (scaled_w, scaled_h))
+            view_surf.blit(self._exp_scaled, (dest_x, dest_y))
 
-        self._ensure_trail()
+        trail_dirty = self._ensure_trail()
         if self.trail_surface is not None:
-            trail_src = self.trail_surface.subsurface((src_x, src_y, src_w, src_h))
-            trail_scaled = pygame.transform.scale(trail_src, (scaled_w, scaled_h))
-            view_surf.blit(trail_scaled, (dest_x, dest_y))
+            if need_rescale or trail_dirty or self._trail_scaled is None:
+                trail_src = self.trail_surface.subsurface((src_x, src_y, src_w, src_h))
+                self._trail_scaled = pygame.transform.scale(trail_src, (scaled_w, scaled_h))
+            view_surf.blit(self._trail_scaled, (dest_x, dest_y))
 
-        # Debug: focus / frontier bounding box in world space
+        self._scale_cache_key = cache_key
+
         if self.debug_camera and self._focus_box is not None:
             min_x, min_y, max_x, max_y = self._focus_box
             # Same transform as the scaled maze blit
@@ -865,11 +881,11 @@ class MazeRenderer:
             return
         pygame.draw.rect(self.explore_surface, (*color, 255), (x, y, w, h))
 
-    def _update_exploration_fade(self) -> None:
+    def _update_exploration_fade(self) -> bool:
         """Advance highlight→grey only for cells still fading (not all visited)."""
         with self._explore_lock:
             if not self._fading:
-                return
+                return False
             fading = list(self._fading)
             explored = self._explored
 
@@ -894,4 +910,5 @@ class MazeRenderer:
             with self._explore_lock:
                 for c in done:
                     self._fading.discard(c)
+        return True  # at least one cell was still fading / painted
 
