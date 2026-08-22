@@ -158,9 +158,9 @@ class MazeEngine:
     def has_visited(self, cell: Cell) -> bool:
         return cell in self.visited
 
-
-    # instead of recomputing each time, what if when updated, we update
-    # frontier...
+    def _instant_mode(self) -> bool:
+        """True when animation duration is 0 — skip per-step frame sync."""
+        return getattr(self.renderer, "_anim_duration_ms", 1) <= 0
 
     def _recompute_frontier(self) -> None:
         """
@@ -190,6 +190,8 @@ class MazeEngine:
         target = current.moved(direction)
 
         if not self.maze.is_open_cell(target):
+            if self._instant_mode():
+                return False  # no bump animation in turbo mode
             done = threading.Event()
             req = AnimRequest(
                 kind=AnimKind.BUMP,
@@ -216,6 +218,16 @@ class MazeEngine:
         self.visited.add(target)
         self.visited_open.add(target)
         self._recompute_frontier()
+
+        if self._instant_mode():
+            # Apply path on the worker under lock — no frame-sync wait.
+            with self._lock:
+                self.path_stack = deque(new_path)
+            self.renderer.snap_to_cell(target, new_path)
+            if target == self.maze.goal:
+                self.game_over = True
+                self._pending_goal = (self.move_count, len(new_path))
+            return True
 
         done = threading.Event()
         req = AnimRequest(
@@ -259,6 +271,16 @@ class MazeEngine:
         # Teleport does not count as a "move attempt" for the counter, but
         # we still animate so the UI stays in sync.
         new_path = [cell]
+
+        if self._instant_mode():
+            with self._lock:
+                self.path_stack = deque(new_path)
+            self.renderer.snap_to_cell(cell, new_path)
+            if cell == self.maze.goal:
+                self.game_over = True
+                self._pending_goal = (self.move_count, len(new_path))
+            return True
+
         done = threading.Event()
         req = AnimRequest(
             kind=AnimKind.TELEPORT,

@@ -158,6 +158,15 @@ class MazeRenderer:
     def set_animation_duration_ms(self, ms: int) -> None:
         self._anim_duration_ms = max(0, ms)
 
+    def snap_to_cell(self, cell: Cell, path: List[Cell]) -> None:
+        """Instant path/sprite update (turbo mode — may be called from worker)."""
+        self.path = list(path)
+        self.invalidate_trail()
+        cx, cy = self._cell_center(cell)
+        self.sprite_x = cx
+        self.sprite_y = cy
+        self.mark_explored(cell)
+
     def is_animating(self) -> bool:
         return self._animating
 
