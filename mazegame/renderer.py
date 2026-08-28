@@ -47,7 +47,6 @@ FADE_DURATION_S = 4.0  # seconds from full highlight → grey
 RECENT_N = 48  # how many most-recent cells drive the camera
 # Critically-damped spring: higher omega = snappier, zeta=1 is critical damping
 CAMERA_OMEGA = 3.5          # natural frequency (rad/s) for pan
-CAMERA_ZOOM_OMEGA = 2.5     # slightly softer zoom response
 MIN_VIEW_CELLS = 18  # minimum focus span in logical rooms (limits how tight we zoom)
 PADDING_CELLS = 4  # extra cells of padding around frontier leaves
 MAX_ZOOM = 1.25  # never zoom in tighter than this (1.0 = 1 world px → 1 screen px)
@@ -85,7 +84,6 @@ class MazeRenderer:
         self.trail_path_size = -1
         self.sprite_x = 0.0
         self.sprite_y = 0.0
-        self._anim_duration_ms = 150
         self._animating = False
         self._anim_done: Optional[threading.Event] = None
         self._anim_kind: Optional[str] = None
@@ -93,8 +91,7 @@ class MazeRenderer:
         self._anim_to: Tuple[float, float] = (0.0, 0.0)
         self._anim_steps = 1
         self._anim_step = 0
-        self._anim_per_step_ms = 1
-        self._anim_elapsed = 0.0
+        self._frames_per_move = 10
         self._bump_center: Tuple[float, float] = (0.0, 0.0)
         self._bump_target: Tuple[float, float] = (0.0, 0.0)
         self._bump_phase = 0  # 0 = out, 1 = back
@@ -155,8 +152,10 @@ class MazeRenderer:
     # Public API used by engine / main
     # ------------------------------------------------------------------
 
-    def set_animation_duration_ms(self, ms: int) -> None:
-        self._anim_duration_ms = max(0, ms)
+
+    def set_frames_per_move(self, frames: int) -> None:
+        """How many display frames a single move/bump/teleport should span."""
+        self._frames_per_move = max(1, min(MAX_ANIMATION_STEPS, int(frames)))
 
     def snap_to_cell(self, cell: Cell, path: List[Cell]) -> None:
         """Instant path/sprite update (turbo mode — may be called from worker)."""
@@ -250,17 +249,6 @@ class MazeRenderer:
         with self._explore_lock:
             self._frontier = set(cells)
 
-    def add_to_frontier(self, cell: Cell) -> None:
-        with self._explore_lock:
-            self._frontier.add(cell)
-
-    def remove_from_frontier(self, cell: Cell) -> None:
-        with self._explore_lock:
-            self._frontier.discard(cell)
-
-    def clear_frontier(self) -> None:
-        with self._explore_lock:
-            self._frontier.clear()
 
     # ------------------------------------------------------------------
     # Geometry (variable thickness)
@@ -300,8 +288,7 @@ class MazeRenderer:
         surf.fill(BG)
         for r in range(self.maze.rows):
             for c in range(self.maze.cols):
-                open_ = self.maze.is_open(r, c)
-                color = OPEN_COLOR if open_ else WALL_COLOR
+                color = OPEN_COLOR if self.maze.is_open(r, c) else WALL_COLOR
                 rect = pygame.Rect(
                     self.col_x(c),
                     self.row_y(r),
@@ -345,8 +332,8 @@ class MazeRenderer:
             )
             pygame.draw.rect(surf, TRAIL_COLOR, rect, border_radius=6)
         self.trail_surface = surf
-        return True
         self.trail_path_size = len(self.path)
+        return True
 
     def _reset_sprite(self, cell: Cell) -> None:
         self.sprite_x, self.sprite_y = self._cell_center(cell)
@@ -356,17 +343,15 @@ class MazeRenderer:
     # Animation
     # ------------------------------------------------------------------
 
-    def _steps_for_duration(self) -> int:
-        if self._anim_duration_ms <= 4:
-            return 1
-        steps = self._anim_duration_ms // 4
-        return max(1, min(MAX_ANIMATION_STEPS, steps))
+    def _steps_for_move(self) -> int:
+        """Frame count for the current move — owned by main via set_frames_per_move."""
+        return max(1, min(MAX_ANIMATION_STEPS, self._frames_per_move))
 
     def animate_move(
         self, from_cell: Cell, to_cell: Cell, done: threading.Event
     ) -> None:
         to_px = self._cell_center(to_cell)
-        steps = self._steps_for_duration()
+        steps = self._steps_for_move()
         if steps <= 1:
             self.sprite_x, self.sprite_y = to_px
             self.path = self.path  # already updated by engine
@@ -379,15 +364,13 @@ class MazeRenderer:
         self._anim_to = to_px
         self._anim_steps = steps
         self._anim_step = 0
-        self._anim_elapsed = 0.0
-        self._anim_per_step_ms = max(1, self._anim_duration_ms // steps)
         self._anim_done = done
         self._animating = True
 
     def animate_bump(
         self, at: Cell, direction: Direction, done: threading.Event
     ) -> None:
-        steps = self._steps_for_duration()
+        steps = self._steps_for_move()
         if steps <= 1:
             done.set()
             return
@@ -405,7 +388,7 @@ class MazeRenderer:
         self._anim_steps = total_steps
         self._anim_step = 0
         self._anim_elapsed = 0.0
-        self._anim_per_step_ms = max(1, self._anim_duration_ms // total_steps // 2)
+        self._anim_per_step_ms = 1
         self._anim_done = done
         self._animating = True
 
@@ -415,7 +398,7 @@ class MazeRenderer:
         """Snap the sprite to to_cell. Uses a short fade-style hop when slow."""
         to_px = self._cell_center(to_cell)
         # Teleports are intentionally snappy: at most a few frames.
-        steps = min(4, self._steps_for_duration())
+        steps = min(4, self._steps_for_move())
         if steps <= 1:
             self.sprite_x, self.sprite_y = to_px
             self.invalidate_trail()
@@ -427,51 +410,48 @@ class MazeRenderer:
         self._anim_to = to_px
         self._anim_steps = steps
         self._anim_step = 0
-        self._anim_elapsed = 0.0
-        self._anim_per_step_ms = max(1, max(8, self._anim_duration_ms // 4) // steps)
         self._anim_done = done
         self._animating = True
 
-    def tick(self, dt_ms: float) -> None:
-        """Advance animation by dt_ms milliseconds. Call every frame."""
+    def tick(self, dt_ms: float = 0.0) -> None:
+        """Advance the current animation by exactly one display frame.
+
+        Pacing is external: main controls how often this is called via
+        clock.tick(fps), and how many frames a move lasts via
+        set_frames_per_move(). dt_ms is ignored for move progression.
+        """
         if not self._animating or self._anim_done is None:
             return
-        self._anim_elapsed += dt_ms
-        while self._anim_elapsed >= self._anim_per_step_ms:
-            self._anim_elapsed -= self._anim_per_step_ms
-            self._anim_step += 1
-            if self._anim_kind in ("move", "teleport"):
-                t = min(1.0, self._anim_step / self._anim_steps)
-                t = _ease_in_out(t)
-                fx, fy = self._anim_from
-                tx, ty = self._anim_to
-                self.sprite_x = fx + (tx - fx) * t
-                self.sprite_y = fy + (ty - fy) * t
+        self._anim_step += 1
+        if self._anim_kind in ("move", "teleport"):
+            t = min(1.0, self._anim_step / float(self._anim_steps))
+            t = _ease_in_out(t)
+            fx, fy = self._anim_from
+            tx, ty = self._anim_to
+            self.sprite_x = fx + (tx - fx) * t
+            self.sprite_y = fy + (ty - fy) * t
+            if self._anim_step >= self._anim_steps:
+                self.sprite_x, self.sprite_y = tx, ty
+                self._finish_anim()
+        elif self._anim_kind == "bump":
+            t = min(1.0, self._anim_step / float(self._anim_steps))
+            t = _ease_in_out(t)
+            cx, cy = self._bump_center
+            tx, ty = self._bump_target
+            if self._bump_phase == 0:
+                self.sprite_x = cx + (tx - cx) * t
+                self.sprite_y = cy + (ty - cy) * t
                 if self._anim_step >= self._anim_steps:
-                    self.sprite_x, self.sprite_y = tx, ty
+                    self._bump_phase = 1
+                    self._anim_step = 0
+            else:
+                self.sprite_x = tx + (cx - tx) * t
+                self.sprite_y = ty + (cy - ty) * t
+                if self._anim_step >= self._anim_steps:
+                    self.sprite_x, self.sprite_y = cx, cy
                     self._finish_anim()
-            elif self._anim_kind == "bump":
-                t = self._anim_step / self._anim_steps
-                if self._bump_phase == 0:
-                    # out
-                    t = min(1.0, t)
-                    cx, cy = self._bump_center
-                    tx, ty = self._bump_target
-                    self.sprite_x = cx + (tx - cx) * t
-                    self.sprite_y = cy + (ty - cy) * t
-                    if self._anim_step >= self._anim_steps:
-                        self._bump_phase = 1
-                        self._anim_step = 0
-                else:
-                    # back
-                    t = min(1.0, t)
-                    cx, cy = self._bump_center
-                    tx, ty = self._bump_target
-                    self.sprite_x = tx + (cx - tx) * t
-                    self.sprite_y = ty + (cy - ty) * t
-                    if self._anim_step >= self._anim_steps:
-                        self.sprite_x, self.sprite_y = cx, cy
-                        self._finish_anim()
+        else:
+            self._finish_anim()
 
     def _finish_anim(self) -> None:
         self._animating = False

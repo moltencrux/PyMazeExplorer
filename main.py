@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import sys
+import time
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -253,7 +254,10 @@ class MazeApp:
 
         # Slider x is placed during draw after the explorer + arrows + Speed label
         self.slider = Slider(pygame.Rect(0, y + 8, 120, 20), 1, 100, 60)
-        self._anim_batch = 1  # steps processed per frame at high speed
+        self._anim_batch = 1
+        self._turbo = False
+        self._fps = 60
+        self._frames_per_move = 10
         self.buttons: List[Button] = [
             self.btn_new,
             self.btn_start,
@@ -278,21 +282,42 @@ class MazeApp:
 
     def apply_speed(self) -> None:
         """
+        Speed is owned here (main), not by the renderer/engine time math.
+
         Slider 1..100:
-          1..70  → animated moves, ~400 ms down to ~0 ms per step
-          71..100 → instant moves, batch 1..30 steps per frame (faster than 60 Hz)
+          Low  → lower display FPS (clock.tick), more frames per move
+          Mid  → 60 FPS, fewer frames per move
+          High → 60 FPS, 1 frame per move
+          Top  → turbo (solver does not wait on the frame loop)
+
+        Renderer only advances one animation frame per tick(); main decides
+        how often tick runs (fps) and how many frames a move lasts.
         """
+        self._fps = 0
+        fpm = 24
         v = self.slider.value
-        if v <= 70:
-            # 1 → 400ms, 70 → 0ms
-            duration = int(400 * (70 - v) / 69) if v < 70 else 0
-            self._anim_batch = 1
+        t = (v - 1) / 99.0  # 0 .. 1
+
+        # FPS: 12 at left → 60 by ~mid, then stays 60
+        if t < 0.70:
+            self._fps = int(round(24 * (((0.7) / (0.7 - t)) ** 0.4)))
+            # self._fps = int(round(12 + (60 - 12) * (t / 0.45)))
         else:
-            # 71 → batch 2, 100 → batch 30
-            duration = 0
-            self._anim_batch = 2 + int((v - 71) * 28 / 29)
+            # Frames per move: 24 at left → 1 near the right (smooth ramp)
+            # Hold a little detail in the lower half, then drop toward 1.
+            fpm = int(round(1.0 + 23.0 * (t - 0.7 )/0.3))
+            # fpm = 1 + 23 * ((1.0 - t) ** 1.4)
+
+        self._frames_per_move = max(1, int(round(fpm)))
+
+        # Turbo only at the far right (roughly last 10% of the dial)
+        self._turbo = t >= 0.70
+        # Optional batching when 1 frame/move but not yet turbo (small gain)
+        self._anim_batch = 1 if not self._turbo else max(1, int(1 + 20 * ((t - 0.70) / 0.30)))
+
         if self.engine is not None:
-            self.engine.set_animation_duration_ms(duration)
+            self.engine.set_frames_per_move(self._frames_per_move)
+            self.engine.set_turbo(self._turbo)
 
     def on_play_pause(self) -> None:
         if self.engine is None:
@@ -382,7 +407,7 @@ class MazeApp:
     def run(self) -> None:
         running = True
         while running:
-            dt = self.clock.tick(60)
+            dt = self.clock.tick(getattr(self, "_fps", 60))
             dt_s = dt / 1000.0
 
             for event in pygame.event.get():
@@ -435,15 +460,11 @@ class MazeApp:
 
             # Engine / animation — at high speed, drain several instant steps per frame
             if self.engine is not None:
-                batch = max(1, getattr(self, "_anim_batch", 1))
-                for _ in range(batch):
-                    goal = self.engine.poll()
-                    if goal is not None:
-                        self._goal_moves, self._goal_path = goal
-                        self._show_goal_dialog = True
-                    self.renderer.tick(dt if _ == 0 else 0)
-                    if self.renderer.is_animating():
-                        break  # mid-animation; wait for more frames
+                goal = self.engine.poll()
+                if goal is not None:
+                    self._goal_moves, self._goal_path = goal
+                    self._show_goal_dialog = True
+                self.renderer.tick()
                 if not self.renderer.is_animating():
                     self.renderer.update_path(list(self.engine.path_stack))
 

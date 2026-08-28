@@ -68,6 +68,7 @@ class MazeEngine:
         self._goal_listener: Optional[Callable[[int, int], None]] = None
         self._anim_queue: Deque[AnimRequest] = deque()
         self._lock = threading.Lock()
+        self._turbo = False  # skip per-step frame sync when True
 
         renderer.set_engine_state(maze, list(self.path_stack), maze.start)
         self._recompute_frontier()
@@ -75,8 +76,15 @@ class MazeEngine:
     def set_goal_listener(self, listener: Callable[[int, int], None]) -> None:
         self._goal_listener = listener
 
-    def set_animation_duration_ms(self, ms: int) -> None:
-        self.renderer.set_animation_duration_ms(ms)
+    # def set_animation_duration_ms(self, ms: int) -> None:
+    #     self.renderer.set_animation_duration_ms(ms)
+
+    def set_frames_per_move(self, frames: int) -> None:
+        self.renderer.set_frames_per_move(frames)
+
+    def set_turbo(self, enabled: bool) -> None:
+        """When True, move/teleport apply immediately without waiting on a frame."""
+        self._turbo = bool(enabled)
 
     def pause(self) -> None:
         self.paused = True
@@ -159,8 +167,8 @@ class MazeEngine:
         return cell in self.visited
 
     def _instant_mode(self) -> bool:
-        """True when animation duration is 0 — skip per-step frame sync."""
-        return getattr(self.renderer, "_anim_duration_ms", 1) <= 0
+        """True in turbo band — skip per-step frame sync entirely."""
+        return self._turbo
 
     def _recompute_frontier(self) -> None:
         """
