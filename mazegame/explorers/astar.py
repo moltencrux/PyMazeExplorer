@@ -38,8 +38,6 @@ class AStarExplorer(BaseExplorer):
         closed: Set[Cell] = set()
         in_open: Set[Cell] = {start}
 
-        # self.mark_explored(start)
-
         while open_heap:
             _f, g, _tie, cell = heapq.heappop(open_heap)
             if cell not in in_open:
@@ -53,8 +51,6 @@ class AStarExplorer(BaseExplorer):
             # Jump to this node so can_move / get_hint are valid here.
             if not self.teleport(cell):
                 continue
-
-            # self.mark_explored(cell)
 
             if self.is_at_goal():
                 return
@@ -92,7 +88,6 @@ class AStarExplorer(BaseExplorer):
                     counter += 1
                     heapq.heappush(open_heap, (f_n, tentative_g, counter, neighbour))
                     in_open.add(neighbour)
-                    # self.mark_explored(neighbour)
                     self.teleport(cell)
                 else:
                     # Already visited — just improve the score / parent.
@@ -103,4 +98,3 @@ class AStarExplorer(BaseExplorer):
                     counter += 1
                     heapq.heappush(open_heap, (f_n, tentative_g, counter, neighbour))
                     in_open.add(neighbour)
-                    # self.mark_explored(neighbour)

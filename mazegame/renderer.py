@@ -29,7 +29,7 @@ ROOM_SIZE = 26
 # Pixel thickness of wall / opening cells (even row/col indices).
 WALL_THICKNESS = 4
 
-MAX_ANIMATION_STEPS = 20
+MAX_ANIMATION_STEPS = 10
 
 BG = (0xF5, 0xF5, 0xF5)
 WALL_COLOR = (0x00, 0xFF, 0xFF)  # cyan walls (matches Java)
@@ -153,8 +153,9 @@ class MazeRenderer:
 
 
     def set_frames_per_move(self, frames: float) -> None:
-        """Display frames to cross one cell edge (may be fractional, e.g. 1.5)."""
-        self._frames_per_move = max(1.0, min(float(MAX_ANIMATION_STEPS), float(frames)))
+        """Display frames per cell-edge (float; may be < 1 for multiple edges/frame)."""
+        # Floor avoids melting the CPU; ceiling keeps slow end reasonable.
+        self._frames_per_move = max(1.0 / 32.0, min(float(MAX_ANIMATION_STEPS), float(frames)))
 
     def set_camera_omega_scale(self, scale: float) -> None:
         """Scale camera spring stiffness (1.0 = default)."""
@@ -335,35 +336,27 @@ class MazeRenderer:
     # Animation
     # ------------------------------------------------------------------
 
-    def _fpm(self) -> float:
-        return max(1.0, float(self._frames_per_move))
+    def frames_per_move(self) -> float:
+        return max(1.0 / 32.0, float(self._frames_per_move))
 
     def animate_move(self, from_cell: Cell, to_cell: Cell) -> None:
-        to_px = self._cell_center(to_cell)
-        if self._fpm() <= 1.0 + 1e-6:
-            # Complete in the same poll(); residual not needed at exactly 1.
-            self.sprite_x, self.sprite_y = to_px
-            self.invalidate_trail()
-            self._animating = False
-            return
+        """Start a move; progress is advanced by advance_anim()."""
         from_px = self._cell_center(from_cell)
+        to_px = self._cell_center(to_cell)
         self._anim_kind = "move"
         self._anim_from = from_px
         self._anim_to = to_px
         self._anim_progress = 0.0
         self._animating = True
+        self.invalidate_trail()
 
     def animate_bump(self, at: Cell, direction: Direction) -> None:
-        if self._fpm() <= 1.0 + 1e-6:
-            self._animating = False
-            return
         center = self._cell_center(at)
         nudge = ROOM_SIZE * 0.28
         target = (
             center[0] + direction.d_col * nudge,
             center[1] + direction.d_row * nudge,
         )
-        total_steps = max(2, steps // 2)
         self._anim_kind = "bump"
         self._bump_center = center
         self._bump_target = target
@@ -372,63 +365,72 @@ class MazeRenderer:
         self._animating = True
 
     def animate_teleport(self, from_cell: Cell, to_cell: Cell) -> None:
-        to_px = self._cell_center(to_cell)
-        # Teleports use a shorter span: min(4, fpm)
-        if min(4.0, self._fpm()) <= 1.0 + 1e-6:
-            self.sprite_x, self.sprite_y = to_px
-            self.invalidate_trail()
-            self._animating = False
-            return
         from_px = self._cell_center(from_cell)
+        to_px = self._cell_center(to_cell)
         self._anim_kind = "teleport"
         self._anim_from = from_px
         self._anim_to = to_px
+        self._anim_progress = 0.0
         self._animating = True
+        self.invalidate_trail()
 
-    def tick(self, dt_ms: float = 0.0) -> None:
-        """Advance the current animation by one display frame.
+    def advance_anim(self, edge_delta: float) -> float:
+        """Advance the current anim by edge_delta units of edge-progress.
 
-        Progress increases by 1/fpm each tick so fractional frames_per_move
-        (e.g. 1.5) blend smoothly between integer speeds.
+        One full edge (or bump out+back) costs 1.0. Returns unused delta so
+        the engine can start the next queued step in the same frame.
         """
-        if not self._animating:
-            return
+        if not self._animating or edge_delta <= 0:
+            return edge_delta
+
+        remaining = edge_delta
 
         if self._anim_kind in ("move", "teleport"):
-            span = self._fpm() if self._anim_kind == "move" else min(4.0, self._fpm())
-            self._anim_progress += 1.0 / span
+            need = 1.0 - self._anim_progress
+            step = min(remaining, need)
+            self._anim_progress += step
+            remaining -= step
             t = min(1.0, self._anim_progress)
             t_e = _ease_in_out(t)
             fx, fy = self._anim_from
             tx, ty = self._anim_to
             self.sprite_x = fx + (tx - fx) * t_e
             self.sprite_y = fy + (ty - fy) * t_e
-            if self._anim_progress >= 1.0:
+            if self._anim_progress >= 1.0 - 1e-9:
                 self.sprite_x, self.sprite_y = tx, ty
                 self._animating = False
 
         elif self._anim_kind == "bump":
-            # Out and back: each half uses half the fpm span (min 1).
-            span = max(1.0, self._fpm() * 0.5)
-            self._anim_progress += 1.0 / span
-            t = min(1.0, self._anim_progress)
-            t_e = _ease_in_out(t)
-            cx, cy = self._bump_center
-            tx, ty = self._bump_target
-            if self._bump_phase == 0:
-                self.sprite_x = cx + (tx - cx) * t_e
-                self.sprite_y = cy + (ty - cy) * t_e
-                if self._anim_progress >= 1.0:
-                    self._bump_phase = 1
-                    self._anim_progress = 0.0
-            else:
-                self.sprite_x = tx + (cx - tx) * t_e
-                self.sprite_y = ty + (cy - ty) * t_e
-                if self._anim_progress >= 1.0:
-                    self.sprite_x, self.sprite_y = cx, cy
-                    self._animating = False
+            # Two half-edges: out then back. Total cost 1.0.
+            while remaining > 0 and self._animating:
+                need = 1.0 - self._anim_progress
+                step = min(remaining, need)
+                self._anim_progress += step
+                remaining -= step
+                t = min(1.0, self._anim_progress)
+                t_e = _ease_in_out(t)
+                cx, cy = self._bump_center
+                tx, ty = self._bump_target
+                if self._bump_phase == 0:
+                    self.sprite_x = cx + (tx - cx) * t_e
+                    self.sprite_y = cy + (ty - cy) * t_e
+                    if self._anim_progress >= 1.0 - 1e-9:
+                        self._bump_phase = 1
+                        self._anim_progress = 0.0
+                else:
+                    self.sprite_x = tx + (cx - tx) * t_e
+                    self.sprite_y = ty + (cy - ty) * t_e
+                    if self._anim_progress >= 1.0 - 1e-9:
+                        self.sprite_x, self.sprite_y = cx, cy
+                        self._animating = False
         else:
             self._animating = False
+
+        return remaining
+
+    def tick(self, dt_ms: float = 0.0) -> None:
+        """Legacy no-op: playback is driven by engine.advance_playback()."""
+        return
 
     def update_camera(self, viewport_w: int, viewport_h: int, dt: float) -> None:
         """Spring each view-edge independently toward the focus box, then derive cam/zoom."""

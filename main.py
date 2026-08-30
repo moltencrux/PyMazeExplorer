@@ -29,7 +29,7 @@ from mazegame.base_explorer import BaseExplorer
 from mazegame.explorers import AStarExplorer, DFSExplorer, RandomWalkExplorer, WallFollowerExplorer
 from mazegame.maze import Maze
 from mazegame.maze_engine import MazeEngine
-from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS
+from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS, MAX_ANIMATION_STEPS
 
 # ---------------------------------------------------------------------------
 # Explorer registry (students add their class here)
@@ -48,8 +48,8 @@ DEFAULT_CELLS_WIDE = 72
 DEFAULT_CELLS_HIGH = 54
 
 # Preferred window size (maze is scrolled inside the viewport above controls)
-WINDOW_W = 1280
-WINDOW_H = 800
+WINDOW_W = 1064
+WINDOW_H = 800 + 56
 
 # UI colours
 UI_BG = (40, 44, 52)
@@ -286,22 +286,23 @@ class MazeApp:
           High → FPS up to 60, fewer frames to cross each cell edge
           Camera spring ω scales up slightly at the high end
 
-        The solver posts moves to a bounded async queue and is not gated on
-        frames_per_move — that only controls how long each step looks on screen.
+        frames_per_move may be < 1 (multiple edges per frame). Solver stays
+        async; playback speed is entirely the budget in advance_playback().
         """
         v = self.slider.value
         t = (v - 1) / 99.0  # 0 .. 1
 
         # FPS: 12 at left → 60 by ~mid, then held
-        if t < 0.45:
-            self._fps = int(round(12 + (60 - 12) * (t / 0.45)))
+        if t < 1 / 3:
+            self._fps = int(round(12 + (60 - 12) * (t / 3)))
         else:
             self._fps = 60
 
-        # Frames to animate one cell→neighbour: 20 at left → 1 at right (float OK)
-        fpm = 1.0 + 9.0 * ((1.0 - t) ** 1.35)
-        self._frames_per_move = max(1.0, fpm)
-        self.status = f"{fpm = }, fps = {self._fps}"
+        # Frames per cell-edge: ~20 (slow) → ~0.25 (several edges per frame).
+        # Continuous through 1.0 — no special "instant drain" mode.
+        fpm = 0.10 + 9.90 * (((1.0 - t) * 3 / 2) ** 1.5)
+        self._frames_per_move = float(min(max(1.0 / 64.0, fpm), MAX_ANIMATION_STEPS))
+
         # Camera follows a bit more tightly when playback is dense
         omega_scale = 0.7 + 0.9 * t  # 0.7 .. 1.6
 
@@ -449,22 +450,12 @@ class MazeApp:
                 if self.slider.handle_event(event):
                     self.apply_speed()
 
-            # Engine / animation (main thread only)
+            # Engine / animation — unified budget in advance_playback()
             if self.engine is not None:
-                # Drain any 1-frame (instant) steps; stop when a multi-frame
-                # anim is in progress or the queue is empty.
-                for _ in range(64):
-                    if self.renderer.is_animating():
-                        break
-                    goal = self.engine.poll()
-                    if goal is not None:
-                        self._goal_moves, self._goal_path = goal
-                        self._show_goal_dialog = True
-                    if self.renderer.is_animating():
-                        break
-                    if not self.engine.has_pending_anims():
-                        break
-                self.renderer.tick()
+                goal = self.engine.advance_playback()
+                if goal is not None:
+                    self._goal_moves, self._goal_path = goal
+                    self._show_goal_dialog = True
                 if not self.renderer.is_animating():
                     self.renderer.update_path(list(self.engine.path_stack))
 

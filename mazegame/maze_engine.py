@@ -73,6 +73,7 @@ class MazeEngine:
         self._queue_cond = threading.Condition()
         self._lock = threading.Lock()
         self._pending_goal: Optional[tuple[int, int]] = None
+        self._play_budget: float = 0.0  # residual edge-units across frames
 
         self._logic_cell = maze.start
         self._logic_path: List[Cell] = [maze.start]
@@ -123,6 +124,7 @@ class MazeEngine:
         self.game_over = False
         self.paused = False
         self._pending_goal = None
+        self._play_budget = 0.0
         self._logic_cell = self.maze.start
         self._logic_path = [self.maze.start]
         self.renderer.set_engine_state(self.maze, list(self.path_stack), self.maze.start)
@@ -306,20 +308,13 @@ class MazeEngine:
         with self._queue_cond:
             return bool(self._anim_queue)
 
-    def poll(self) -> Optional[tuple[int, int]]:
-        """Start the next queued anim if the renderer is idle. Return goal event if any."""
-        goal_event = self._pending_goal
-        if goal_event is not None:
-            self._pending_goal = None
-
-        if self.renderer.is_animating():
-            return goal_event
-
+    def _start_next_anim(self) -> bool:
+        """Pop one queue item and start its animation. Returns False if empty."""
         with self._queue_cond:
             if not self._anim_queue:
-                return goal_event
+                return False
             req = self._anim_queue.popleft()
-            self._queue_cond.notify_all()  # worker may be waiting for space
+            self._queue_cond.notify_all()
 
         if req.kind == AnimKind.MOVE and req.new_path is not None:
             self.path_stack = deque(req.new_path)
@@ -337,10 +332,56 @@ class MazeEngine:
                 self.renderer.animate_teleport(req.from_cell, req.to_cell)
         elif req.kind == AnimKind.BUMP and req.direction is not None:
             self.renderer.animate_bump(req.from_cell, req.direction)
+        else:
+            return False
+        return True
+
+    def advance_playback(self) -> Optional[tuple[int, int]]:
+        """Drive anim queue for one display frame using a unified edge budget.
+
+        Each frame adds 1/fpm edge-units. fpm>1 → slow multi-frame moves;
+        fpm<1 → multiple edges per frame. Residual budget carries across frames.
+        """
+        goal_event = self._pending_goal
+        if goal_event is not None:
+            self._pending_goal = None
+
+        fpm = self.renderer.frames_per_move()
+        self._play_budget += 1.0 / fpm
+
+        # Safety: never process more than this many edges in one frame
+        max_edges = 32
+        edges = 0
+
+        while self._play_budget > 1e-9 and edges < max_edges:
+            if not self.renderer.is_animating():
+                if not self._start_next_anim():
+                    break  # queue empty
+            # Advance current anim; unused delta stays in budget for next edge
+            before = self._play_budget
+            self._play_budget = self.renderer.advance_anim(self._play_budget)
+            consumed = before - self._play_budget
+            if consumed <= 1e-12 and self.renderer.is_animating():
+                # No progress (shouldn't happen) — avoid spin
+                break
+            if not self.renderer.is_animating():
+                edges += 1  # completed one edge this frame
+            else:
+                # Mid-lerp; wait for next display frame
+                break
+
+        # If idle with empty queue, don't pile up unbounded budget
+        if not self.renderer.is_animating() and not self.has_pending_anims():
+            self._play_budget = 0.0
 
         return goal_event
 
-    def get_hint(self) -> float:
+    def poll(self) -> Optional[tuple[int, int]]:
+        """Backward-compatible alias for advance_playback()."""
+        return self.advance_playback()
+
+    def get_hint(
+self) -> float:
         cur = self._logical_cell()
         goal = self.maze.goal
         dr = cur.row - goal.row
