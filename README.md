@@ -4,6 +4,14 @@ A Python + Pygame port of the [Java MazeExplorer](https://github.com/moltencrux/
 
 A random block-based maze is generated and shown on screen. Students implement a maze-solving algorithm by subclassing `BaseExplorer`; the app animates their agent moving through the maze, leaves a trail behind it (which un-marks itself when the agent backtracks), and reports success when the goal is reached.
 
+## New in this branch (camera + exploration overlay)
+
+- **Larger default mazes** (72×54 logical cells) that no longer force the window to grow.
+- **Soft-follow camera** driven by the most recent ~48 explored cells, with gentle zoom so the active search front stays visible.
+- **Fading exploration highlight**: newly visited cells light up in amber and gradually settle to a dark grey (never pure unexplored black).
+- **Manual pan / zoom**: drag with the left mouse button to pan; mouse wheel to zoom. Press **C** to clear manual pan and return to auto-follow.
+- Advanced explorers can call `mark_explored(cell)` (or `mark_explored_many`) to highlight frontier / open-set cells without walking the sprite there.
+
 ## Requirements
 
 * Python 3.10+
@@ -29,6 +37,9 @@ python main.py
 | **New Maze** (or N) | Generate a fresh maze |
 | **◀ ▶** / click explorer name / Left·Right arrows | Cycle explorer algorithm |
 | Speed slider | Animation speed (left = slow, right = fast) |
+| Left-drag on maze | Pan the camera |
+| Mouse wheel | Zoom in / out |
+| **C** | Clear manual pan (return to auto-follow) |
 | Esc | Quit |
 
 ## How it works
@@ -64,6 +75,7 @@ python main.py
 * Moves are one square at a time in one of the four cardinal directions only.
 * You never get the maze’s wall grid directly. This is intentional: the exercise is about exploring and remembering, not reading a solved map.
 * The trail shown on screen simply mirrors your current path: stepping forward marks a new square; stepping back onto the square you just came from unmarks it.
+* The exploration overlay is independent of the trail: every cell the sprite steps on is automatically marked, and frontier algorithms can mark additional cells via mark_explored().
 
 ## Variable-thickness walls
 

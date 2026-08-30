@@ -3,38 +3,22 @@
 from __future__ import annotations
 
 from mazegame.base_explorer import BaseExplorer
+from mazegame.direction import Direction
+from itertools import cycle, islice
 
 
 class WallFollowerExplorer(BaseExplorer):
-    # Facing: 0 = up, 1 = right, 2 = down, 3 = left
-    def __init__(self) -> None:
-        super().__init__()
-        self.facing = 1  # start facing right
 
     def solve(self) -> None:
-        while not self.is_at_goal():
-            right_of = (self.facing + 1) % 4
-            if self._try(right_of):
-                self.facing = right_of
-                continue
-            if self._try(self.facing):
-                continue
-            left_of = (self.facing + 3) % 4
-            if self._try(left_of):
-                self.facing = left_of
-                continue
-            # Dead end — only way is back
-            back = (self.facing + 2) % 4
-            self._try(back)
-            self.facing = back
+        dirs = cycle((Direction.RIGHT, Direction.UP, Direction.LEFT, Direction.DOWN))
 
-    def _try(self, direction: int) -> bool:
-        if direction == 0:
-            return self.move_up()
-        if direction == 1:
-            return self.move_right()
-        if direction == 2:
-            return self.move_down()
-        if direction == 3:
-            return self.move_left()
-        raise ValueError(f"bad direction {direction}")
+        while not self.is_at_goal():
+            for d in dirs:
+                if self.can_move(d):
+                    self.move(d)
+                    break
+            # A right turn relative to the current heading is 3 left turns away,
+            # advance by 2 so that the righthand dir is the next in the cycle
+            *islice(dirs, 2),
+
+

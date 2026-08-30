@@ -4,9 +4,11 @@ Maze Explorer – Python / Pygame port.
 
 A random block-based maze is generated and shown on screen. Students implement
 a maze-solving algorithm by subclassing BaseExplorer; the app animates their
-agent moving through the maze, leaves a trail behind it (which un-marks itself
-when the agent backtracks), and congratulates the player when the goal is
-reached.
+agent moving through the maze with a fading exploration overlay, and
+congratulates the player when the goal is reached.
+
+Supports larger mazes with a soft-follow camera driven by recent exploration
+and a fading exploration highlight overlay.
 
 Run:
     pip install pygame
@@ -16,6 +18,7 @@ Run:
 from __future__ import annotations
 
 import sys
+import time
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -25,7 +28,7 @@ from mazegame.base_explorer import BaseExplorer
 from mazegame.explorers import RandomWalkExplorer, WallFollowerExplorer
 from mazegame.maze import Maze
 from mazegame.maze_engine import MazeEngine
-from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS
+from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS, MAX_ANIMATION_STEPS
 
 # ---------------------------------------------------------------------------
 # Explorer registry (students add their class here)
@@ -37,8 +40,13 @@ EXPLORERS: Dict[str, Callable[[], BaseExplorer]] = {
     # EXPLORERS["My Algorithm"] = MyExplorer
 }
 
-DEFAULT_CELLS_WIDE = 36
-DEFAULT_CELLS_HIGH = 28
+# Larger default so the camera / exploration overlay has room to work.
+DEFAULT_CELLS_WIDE = 72
+DEFAULT_CELLS_HIGH = 54
+
+# Preferred window size (maze is scrolled inside the viewport above controls)
+WINDOW_W = 1064
+WINDOW_H = 800 + 56
 
 # UI colours
 UI_BG = (40, 44, 52)
@@ -218,8 +226,7 @@ class MazeApp:
         self._goal_path = 0
 
         self.controls_height = 56
-        # Initial size; will resize after first maze
-        self.screen = pygame.display.set_mode((800, 600), pygame.RESIZABLE)
+        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H), pygame.RESIZABLE)
         self._build_controls()
         self.generate_new_maze()
 
@@ -260,6 +267,8 @@ class MazeApp:
 
         # Slider x is placed during draw after the explorer + arrows + Speed label
         self.slider = Slider(pygame.Rect(0, y + 8, 120, 20), 1, 100, 60)
+        self._fps = 60
+        self._frames_per_move = 10.0
         self.buttons: List[Button] = [
             self.btn_new,
             self.btn_start,
@@ -275,28 +284,45 @@ class MazeApp:
         self.engine.set_goal_listener(self._on_goal_reached)
         self.apply_speed()
         self.state = SolveState.IDLE
-        self.status = "New maze ready. Pick an explorer and press Start."
+        self.status = "New maze ready. Pick an explorer and press Start.  (drag/wheel pan·zoom, D debug box, F overview)"
         self.btn_start.set_mode(0)
         self.btn_start.enabled = True
         self.btn_reset.enabled = False
         self.btn_explorer.enabled = True
-        self._resize_window()
-
-    def _resize_window(self) -> None:
-        if self.renderer.total_width == 0:
-            return
-        w = max(700, self.renderer.total_width + 40)
-        h = self.renderer.total_height + self.controls_height + 40
-        self.screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+        self.renderer.reset_pan()
 
     def apply_speed(self) -> None:
-        # Slider 1..100 → animation duration ~ 300 ms (slow) down to ~ 0 ms (fast)
-        # Same mapping idea as the Java slider.
+        """
+        Pacing owned by main only:
+
+          Low  → lower display FPS (fewer full redraws / less power)
+          High → FPS up to 60, fewer frames to cross each cell edge
+          Camera spring ω scales up slightly at the high end
+
+        frames_per_move may be < 1 (multiple edges per frame). Solver stays
+        async; playback speed is entirely the budget in advance_playback().
+        """
         v = self.slider.value
-        # high slider = faster → shorter duration
-        duration = int(300 * (100 - v) / 99)
+        t = (v - 1) / 99.0  # 0 .. 1
+
+        # FPS: 12 at left → 60 by ~mid, then held
+        if t < 1 / 3:
+            self._fps = int(round(12 + (60 - 12) * (t / 3)))
+        else:
+            self._fps = 60
+
+        # Frames per cell-edge: ~20 (slow) → ~0.25 (several edges per frame).
+        # Continuous through 1.0 — no special "instant drain" mode.
+        fpm = 0.10 + 9.90 * (((1.0 - t) * 3 / 2) ** 1.5)
+        self._frames_per_move = float(min(max(1.0 / 64.0, fpm), MAX_ANIMATION_STEPS))
+
+        # Camera follows a bit more tightly when playback is dense
+        omega_scale = 0.7 + 0.9 * t  # 0.7 .. 1.6
+
         if self.engine is not None:
-            self.engine.set_animation_duration_ms(duration)
+            self.engine.set_frames_per_move(self._frames_per_move)
+        self.renderer.set_camera_omega_scale(omega_scale)
+
 
     def on_play_pause(self) -> None:
         if self.engine is None:
@@ -348,6 +374,7 @@ class MazeApp:
             self.btn_start.set_mode(0)
             self.btn_reset.enabled = False
             self.btn_explorer.enabled = True
+            self.renderer.reset_pan()
 
     def _on_goal_reached(self, move_count: int, path_length: int) -> None:
         # Called from the solver thread via the pending-goal mechanism;
@@ -374,10 +401,20 @@ class MazeApp:
         self.selected_explorer = (self.selected_explorer + delta) % n
         self.btn_explorer.set_label(self.explorer_names[self.selected_explorer])
 
+    def _viewport(self) -> pygame.Rect:
+        """Area available for the maze (everything above the controls strip)."""
+        return pygame.Rect(
+            0, 0,
+            self.screen.get_width(),
+            max(1, self.screen.get_height() - self.controls_height),
+        )
+
     def run(self) -> None:
         running = True
         while running:
-            dt = self.clock.tick(60)
+            dt = self.clock.tick(max(1, getattr(self, "_fps", 60)))
+            dt_s = dt / 1000.0
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -394,22 +431,47 @@ class MazeApp:
                         self.generate_new_maze()
                     elif event.key == pygame.K_r:
                         self.reset_solving()
+                    elif event.key == pygame.K_c:
+                        # centre / clear manual pan
+                        self.renderer.reset_pan()
+                    elif event.key == pygame.K_d:
+                        on = self.renderer.toggle_debug_camera()
+                        self.status = f"Camera debug bbox {'ON' if on else 'OFF'} (magenta)."
+                    elif event.key == pygame.K_f:
+                        on = self.renderer.toggle_overview()
+                        self.status = (
+                            "Overview: full maze."
+                            if on
+                            else "Overview off — frontier framing resumed."
+                        )
+
+                # Pan / zoom only when the pointer is over the maze viewport
+                vp = self._viewport()
+                if event.type in (
+                    pygame.MOUSEBUTTONDOWN,
+                    pygame.MOUSEBUTTONUP,
+                    pygame.MOUSEMOTION,
+                    pygame.MOUSEWHEEL,
+                ):
+                    pos = getattr(event, "pos", None)
+                    if pos is None or vp.collidepoint(pos) or event.type == pygame.MOUSEWHEEL:
+                        if self.renderer.handle_pan_event(event):
+                            continue  # consumed by camera
+
                 for btn in self.buttons:
                     btn.handle_event(event)
                 if self.slider.handle_event(event):
                     self.apply_speed()
 
-            # Engine / animation
+            # Engine / animation — unified budget in advance_playback()
             if self.engine is not None:
-                goal = self.engine.poll()
+                goal = self.engine.advance_playback()
                 if goal is not None:
                     self._goal_moves, self._goal_path = goal
                     self._show_goal_dialog = True
-                self.renderer.tick(dt)
-                # Keep path in sync for trail (skip while animating so we
-                # don't fight the trail-cache rebuild timing).
-                if not self.renderer.is_animating():
-                    self.renderer.update_path(list(self.engine.path_stack))
+                # Soft-follow camera driven by recent exploration
+                vp = self._viewport()
+                self.renderer.update_camera(vp.w, vp.h, dt_s)
 
             if self._show_goal_dialog:
                 self._finish_goal()
@@ -425,10 +487,10 @@ class MazeApp:
 
     def _draw(self) -> None:
         self.screen.fill(UI_BG)
-        # Maze
-        maze_x = max(0, (self.screen.get_width() - self.renderer.total_width) // 2)
-        maze_y = 10
-        self.renderer.draw(self.screen, (maze_x, maze_y))
+
+        # Maze viewport
+        vp = self._viewport()
+        self.renderer.draw(self.screen, vp)
 
         # Controls strip
         strip_y = self.screen.get_height() - self.controls_height
