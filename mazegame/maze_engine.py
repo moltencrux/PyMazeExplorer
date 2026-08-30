@@ -3,12 +3,13 @@ Wires together the Maze (data), the BaseExplorer (student algorithm running
 on a background thread) and the MazeRenderer (Pygame drawing on the main
 thread).
 
-Threading model mirrors the Java version:
-  - All mutable path / game-over state is mutated only on the main (render)
-    thread via a request queue.
-  - The explorer's solve() runs on a dedicated worker thread and calls
-    attempt_move() / attempt_teleport(), which post an animation request and
-    block on an Event until the animation finishes.
+Threading model:
+  - The explorer runs on a worker thread and posts AnimRequests to a bounded
+    queue, then continues (async). It only blocks when the queue is full
+    (backpressure) or when paused / stopped.
+  - Path / sprite animation is applied on the main thread in poll() + tick().
+  - frames_per_move and display FPS are owned by main; the engine does not
+    throttle the algorithm except via queue depth.
 """
 
 from __future__ import annotations
@@ -25,6 +26,9 @@ from .cell import Cell
 from .direction import Direction
 from .maze import Maze
 from .renderer import MazeRenderer
+
+# Max outstanding anims the worker may queue before it must wait for main.
+ANIM_QUEUE_MAX = 64
 
 
 class MazeStoppedException(RuntimeError):
@@ -46,8 +50,7 @@ class AnimRequest:
     from_cell: Cell
     to_cell: Optional[Cell]  # None for bump
     direction: Optional[Direction]  # set for bump
-    done: threading.Event
-    # Path mutation is applied by the main thread before starting the anim.
+    # Path mutation is applied by the main thread when the anim *starts*.
     new_path: Optional[List[Cell]] = None
 
 
@@ -67,24 +70,20 @@ class MazeEngine:
         self._solver_thread: Optional[threading.Thread] = None
         self._goal_listener: Optional[Callable[[int, int], None]] = None
         self._anim_queue: Deque[AnimRequest] = deque()
+        self._queue_cond = threading.Condition()
         self._lock = threading.Lock()
-        self._turbo = False  # skip per-step frame sync when True
+        self._pending_goal: Optional[tuple[int, int]] = None
 
+        self._logic_cell = maze.start
+        self._logic_path: List[Cell] = [maze.start]
         renderer.set_engine_state(maze, list(self.path_stack), maze.start)
         self._recompute_frontier()
 
     def set_goal_listener(self, listener: Callable[[int, int], None]) -> None:
         self._goal_listener = listener
 
-    # def set_animation_duration_ms(self, ms: int) -> None:
-    #     self.renderer.set_animation_duration_ms(ms)
-
-    def set_frames_per_move(self, frames: int) -> None:
+    def set_frames_per_move(self, frames: float) -> None:
         self.renderer.set_frames_per_move(frames)
-
-    def set_turbo(self, enabled: bool) -> None:
-        """When True, move/teleport apply immediately without waiting on a frame."""
-        self._turbo = bool(enabled)
 
     def pause(self) -> None:
         self.paused = True
@@ -109,11 +108,9 @@ class MazeEngine:
             with self._pause_cond:
                 self.paused = False
                 self._pause_cond.notify_all()
-            # Drain pending animations so we don't block.
-            with self._lock:
-                while self._anim_queue:
-                    req = self._anim_queue.popleft()
-                    req.done.set()
+            with self._queue_cond:
+                self._anim_queue.clear()
+                self._queue_cond.notify_all()
         self._solver_thread = None
 
     def reset_to_start(self) -> None:
@@ -125,6 +122,9 @@ class MazeEngine:
         self.move_count = 0
         self.game_over = False
         self.paused = False
+        self._pending_goal = None
+        self._logic_cell = self.maze.start
+        self._logic_path = [self.maze.start]
         self.renderer.set_engine_state(self.maze, list(self.path_stack), self.maze.start)
         self._recompute_frontier()
 
@@ -159,16 +159,17 @@ class MazeEngine:
         return getattr(t, "interrupt", False)
 
     def can_move(self, direction: Direction) -> bool:
-        current = self.path_stack[-1]
+        current = self._logical_cell()
         target = current.moved(direction)
         return self.maze.is_open_cell(target)
 
     def has_visited(self, cell: Cell) -> bool:
         return cell in self.visited
 
-    def _instant_mode(self) -> bool:
-        """True in turbo band — skip per-step frame sync entirely."""
-        return self._turbo
+    def _logical_cell(self) -> Cell:
+        """Cell the algorithm is at (may be ahead of the sprite)."""
+        with self._lock:
+            return self._logic_cell
 
     def _recompute_frontier(self) -> None:
         """
@@ -188,75 +189,64 @@ class MazeEngine:
         self.visited_open -= dead_ends
         self.renderer.set_frontier(frontier)
 
+    def _enqueue(self, req: AnimRequest) -> None:
+        """Post an anim; block only while the queue is at capacity."""
+        with self._queue_cond:
+            while len(self._anim_queue) >= ANIM_QUEUE_MAX:
+                if self._is_interrupted() or self.game_over:
+                    raise MazeStoppedException()
+                self._queue_cond.wait(timeout=0.05)
+            if self._is_interrupted():
+                raise MazeStoppedException()
+            self._anim_queue.append(req)
+
     def attempt_move(self, direction: Direction) -> bool:
         if self.game_over or self._is_interrupted():
             raise MazeStoppedException()
         self._wait_if_paused()
 
         self.move_count += 1
-        current = self.path_stack[-1]
+        current = self._logical_cell()
         target = current.moved(direction)
 
         if not self.maze.is_open_cell(target):
-            if self._instant_mode():
-                return False  # no bump animation in turbo mode
-            done = threading.Event()
-            req = AnimRequest(
-                kind=AnimKind.BUMP,
-                from_cell=current,
-                to_cell=None,
-                direction=direction,
-                done=done,
+            self._enqueue(
+                AnimRequest(
+                    kind=AnimKind.BUMP,
+                    from_cell=current,
+                    to_cell=None,
+                    direction=direction,
+                )
             )
-            with self._lock:
-                self._anim_queue.append(req)
-            self._await(done)
             return False
 
-        # Backing up = moving onto the cell immediately behind us.
-        previous = self.path_stack[-2] if len(self.path_stack) >= 2 else None
-        backing_up = previous is not None and previous == target
+        previous = None
+        with self._lock:
+            # Maintain a worker-side path for logical backtracking.
+            if len(self._logic_path) >= 2 and self._logic_path[-2] == target:
+                self._logic_path.pop()
+            else:
+                self._logic_path.append(target)
+            self._logic_cell = target
+            new_path = list(self._logic_path)
 
-        if backing_up:
-            new_path = list(self.path_stack)[:-1]
-        else:
-            new_path = list(self.path_stack) + [target]
-
-        # Record visit and refresh open leaves for the camera.
         self.visited.add(target)
         self.visited_open.add(target)
         self._recompute_frontier()
 
-        if self._instant_mode():
-            # Apply path on the worker under lock — no frame-sync wait.
-            with self._lock:
-                self.path_stack = deque(new_path)
-            self.renderer.snap_to_cell(target, new_path)
-            if target == self.maze.goal:
-                self.game_over = True
-                self._pending_goal = (self.move_count, len(new_path))
-            return True
-
-        done = threading.Event()
-        req = AnimRequest(
-            kind=AnimKind.MOVE,
-            from_cell=current,
-            to_cell=target,
-            direction=None,
-            done=done,
-            new_path=new_path,
+        self._enqueue(
+            AnimRequest(
+                kind=AnimKind.MOVE,
+                from_cell=current,
+                to_cell=target,
+                direction=None,
+                new_path=new_path,
+            )
         )
-        with self._lock:
-            self._anim_queue.append(req)
-        self._await(done)
 
         if target == self.maze.goal:
             self.game_over = True
-            # new_path was computed above; path_stack is only mutated on the
-            # main thread, so use new_path for the length.
-            final_moves = self.move_count
-            path_len = len(new_path)
-            self._pending_goal = (final_moves, path_len)
+            self._pending_goal = (self.move_count, len(new_path))
         return True
 
     def attempt_teleport(self, cell: Cell) -> bool:
@@ -269,38 +259,28 @@ class MazeEngine:
             raise MazeStoppedException()
         self._wait_if_paused()
 
-        current = self.path_stack[-1]
+        current = self._logical_cell()
         if cell == current:
             return True
-
         if cell not in self.visited:
             return False
 
         # Teleport does not count as a "move attempt" for the counter, but
         # we still animate so the UI stays in sync.
         new_path = [cell]
-
-        if self._instant_mode():
-            with self._lock:
-                self.path_stack = deque(new_path)
-            self.renderer.snap_to_cell(cell, new_path)
-            if cell == self.maze.goal:
-                self.game_over = True
-                self._pending_goal = (self.move_count, len(new_path))
-            return True
-
-        done = threading.Event()
-        req = AnimRequest(
-            kind=AnimKind.TELEPORT,
-            from_cell=current,
-            to_cell=cell,
-            direction=None,
-            done=done,
-            new_path=new_path,
-        )
         with self._lock:
-            self._anim_queue.append(req)
-        self._await(done)
+            self._logic_path = [cell]
+            self._logic_cell = cell
+
+        self._enqueue(
+            AnimRequest(
+                kind=AnimKind.TELEPORT,
+                from_cell=current,
+                to_cell=cell,
+                direction=None,
+                new_path=new_path,
+            )
+        )
 
         if cell == self.maze.goal:
             self.game_over = True
@@ -318,34 +298,28 @@ class MazeEngine:
         """Show or hide the red agent sprite."""
         self.renderer.set_show_sprite(show)
 
-    def _await(self, event: threading.Event) -> None:
-        while not event.wait(timeout=0.05):
-            if self._is_interrupted() or (
-                self.game_over and self.path_stack[-1] != self.maze.goal
-            ):
-                raise MazeStoppedException()
-        if self.game_over and self.path_stack[-1] != self.maze.goal:
-            raise MazeStoppedException()
+    # ------------------------------------------------------------------
+    # Main / render thread
+    # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # Called every frame from the main / render thread
-    # ------------------------------------------------------------------
+    def has_pending_anims(self) -> bool:
+        with self._queue_cond:
+            return bool(self._anim_queue)
 
     def poll(self) -> Optional[tuple[int, int]]:
-        """Process one pending animation request (if any) and return a
-        pending (moves, path_len) goal event if the goal was just reached.
-        """
-        goal_event: Optional[tuple[int, int]] = getattr(self, "_pending_goal", None)
+        """Start the next queued anim if the renderer is idle. Return goal event if any."""
+        goal_event = self._pending_goal
         if goal_event is not None:
-            del self._pending_goal
+            self._pending_goal = None
 
         if self.renderer.is_animating():
             return goal_event
 
-        with self._lock:
+        with self._queue_cond:
             if not self._anim_queue:
                 return goal_event
             req = self._anim_queue.popleft()
+            self._queue_cond.notify_all()  # worker may be waiting for space
 
         if req.kind == AnimKind.MOVE and req.new_path is not None:
             self.path_stack = deque(req.new_path)
@@ -354,37 +328,34 @@ class MazeEngine:
             # exploration overlay stays alive for sequential agents.
             if req.to_cell is not None:
                 self.renderer.mark_explored(req.to_cell)
-            assert req.to_cell is not None
-            self.renderer.animate_move(req.from_cell, req.to_cell, req.done)
+                self.renderer.animate_move(req.from_cell, req.to_cell)
         elif req.kind == AnimKind.TELEPORT and req.new_path is not None:
             self.path_stack = deque(req.new_path)
             self.renderer.update_path(req.new_path)
             if req.to_cell is not None:
                 self.renderer.mark_explored(req.to_cell)
-            assert req.to_cell is not None
-            self.renderer.animate_teleport(req.from_cell, req.to_cell, req.done)
+                self.renderer.animate_teleport(req.from_cell, req.to_cell)
         elif req.kind == AnimKind.BUMP and req.direction is not None:
-            self.renderer.animate_bump(req.from_cell, req.direction, req.done)
-        else:
-            req.done.set()
+            self.renderer.animate_bump(req.from_cell, req.direction)
 
         return goal_event
 
     def get_hint(self) -> float:
-        cur = self.path_stack[-1]
+        cur = self._logical_cell()
         goal = self.maze.goal
         dr = cur.row - goal.row
         dc = cur.col - goal.col
         return math.sqrt(dr * dr + dc * dc)
 
     def is_at_goal(self) -> bool:
-        return self.path_stack[-1] == self.maze.goal
+        return self._logical_cell() == self.maze.goal
 
     def get_row(self) -> int:
-        return self.path_stack[-1].row
+        return self._logical_cell().row
 
     def get_col(self) -> int:
-        return self.path_stack[-1].col
+        return self._logical_cell().col
 
     def get_move_count(self) -> int:
         return self.move_count
+

@@ -85,13 +85,11 @@ class MazeRenderer:
         self.sprite_x = 0.0
         self.sprite_y = 0.0
         self._animating = False
-        self._anim_done: Optional[threading.Event] = None
         self._anim_kind: Optional[str] = None
         self._anim_from: Tuple[float, float] = (0.0, 0.0)
         self._anim_to: Tuple[float, float] = (0.0, 0.0)
-        self._anim_steps = 1
-        self._anim_step = 0
-        self._frames_per_move = 10
+        self._anim_progress = 0.0  # 0..1 through current move (float fpm)
+        self._frames_per_move = 10.0
         self._bump_center: Tuple[float, float] = (0.0, 0.0)
         self._bump_target: Tuple[float, float] = (0.0, 0.0)
         self._bump_phase = 0  # 0 = out, 1 = back
@@ -118,6 +116,7 @@ class MazeRenderer:
 
         # --- Camera: view rectangle edges (world pixels), each with its own velocity.
         # cam_x/cam_y/zoom are derived from the view rect for drawing.
+        self._camera_omega_scale = 1.0
         self.view_left = 0.0
         self.view_right = 1.0
         self.view_top = 0.0
@@ -153,18 +152,13 @@ class MazeRenderer:
     # ------------------------------------------------------------------
 
 
-    def set_frames_per_move(self, frames: int) -> None:
-        """How many display frames a single move/bump/teleport should span."""
-        self._frames_per_move = max(1, min(MAX_ANIMATION_STEPS, int(frames)))
+    def set_frames_per_move(self, frames: float) -> None:
+        """Display frames to cross one cell edge (may be fractional, e.g. 1.5)."""
+        self._frames_per_move = max(1.0, min(float(MAX_ANIMATION_STEPS), float(frames)))
 
-    def snap_to_cell(self, cell: Cell, path: List[Cell]) -> None:
-        """Instant path/sprite update (turbo mode — may be called from worker)."""
-        self.path = list(path)
-        self.invalidate_trail()
-        cx, cy = self._cell_center(cell)
-        self.sprite_x = cx
-        self.sprite_y = cy
-        self.mark_explored(cell)
+    def set_camera_omega_scale(self, scale: float) -> None:
+        """Scale camera spring stiffness (1.0 = default)."""
+        self._camera_omega_scale = max(0.25, min(3.0, float(scale)))
 
     def is_animating(self) -> bool:
         return self._animating
@@ -187,10 +181,7 @@ class MazeRenderer:
         self._bg_scaled = self._exp_scaled = self._trail_scaled = None
         self.mark_explored(start_cell)
         # Cancel any in-flight animation.
-        if self._anim_done is not None:
-            self._anim_done.set()
         self._animating = False
-        self._anim_done = None
         # Reset camera to frame the start cell immediately.
         cx, cy = self._cell_center(start_cell)
         # Reasonable default zoom: a handful of rooms around the start.
@@ -288,7 +279,8 @@ class MazeRenderer:
         surf.fill(BG)
         for r in range(self.maze.rows):
             for c in range(self.maze.cols):
-                color = OPEN_COLOR if self.maze.is_open(r, c) else WALL_COLOR
+                open_ = self.maze.is_open(r, c)
+                color = OPEN_COLOR if open_ else WALL_COLOR
                 rect = pygame.Rect(
                     self.col_x(c),
                     self.row_y(r),
@@ -343,36 +335,27 @@ class MazeRenderer:
     # Animation
     # ------------------------------------------------------------------
 
-    def _steps_for_move(self) -> int:
-        """Frame count for the current move — owned by main via set_frames_per_move."""
-        return max(1, min(MAX_ANIMATION_STEPS, self._frames_per_move))
+    def _fpm(self) -> float:
+        return max(1.0, float(self._frames_per_move))
 
-    def animate_move(
-        self, from_cell: Cell, to_cell: Cell, done: threading.Event
-    ) -> None:
+    def animate_move(self, from_cell: Cell, to_cell: Cell) -> None:
         to_px = self._cell_center(to_cell)
-        steps = self._steps_for_move()
-        if steps <= 1:
+        if self._fpm() <= 1.0 + 1e-6:
+            # Complete in the same poll(); residual not needed at exactly 1.
             self.sprite_x, self.sprite_y = to_px
-            self.path = self.path  # already updated by engine
             self.invalidate_trail()
-            done.set()
+            self._animating = False
             return
         from_px = self._cell_center(from_cell)
         self._anim_kind = "move"
         self._anim_from = from_px
         self._anim_to = to_px
-        self._anim_steps = steps
-        self._anim_step = 0
-        self._anim_done = done
+        self._anim_progress = 0.0
         self._animating = True
 
-    def animate_bump(
-        self, at: Cell, direction: Direction, done: threading.Event
-    ) -> None:
-        steps = self._steps_for_move()
-        if steps <= 1:
-            done.set()
+    def animate_bump(self, at: Cell, direction: Direction) -> None:
+        if self._fpm() <= 1.0 + 1e-6:
+            self._animating = False
             return
         center = self._cell_center(at)
         nudge = ROOM_SIZE * 0.28
@@ -385,84 +368,67 @@ class MazeRenderer:
         self._bump_center = center
         self._bump_target = target
         self._bump_phase = 0
-        self._anim_steps = total_steps
-        self._anim_step = 0
-        self._anim_elapsed = 0.0
-        self._anim_per_step_ms = 1
-        self._anim_done = done
+        self._anim_progress = 0.0
         self._animating = True
 
-    def animate_teleport(
-        self, from_cell: Cell, to_cell: Cell, done: threading.Event
-    ) -> None:
-        """Snap the sprite to to_cell. Uses a short fade-style hop when slow."""
+    def animate_teleport(self, from_cell: Cell, to_cell: Cell) -> None:
         to_px = self._cell_center(to_cell)
-        # Teleports are intentionally snappy: at most a few frames.
-        steps = min(4, self._steps_for_move())
-        if steps <= 1:
+        # Teleports use a shorter span: min(4, fpm)
+        if min(4.0, self._fpm()) <= 1.0 + 1e-6:
             self.sprite_x, self.sprite_y = to_px
             self.invalidate_trail()
-            done.set()
+            self._animating = False
             return
         from_px = self._cell_center(from_cell)
         self._anim_kind = "teleport"
         self._anim_from = from_px
         self._anim_to = to_px
-        self._anim_steps = steps
-        self._anim_step = 0
-        self._anim_done = done
         self._animating = True
 
     def tick(self, dt_ms: float = 0.0) -> None:
-        """Advance the current animation by exactly one display frame.
+        """Advance the current animation by one display frame.
 
-        Pacing is external: main controls how often this is called via
-        clock.tick(fps), and how many frames a move lasts via
-        set_frames_per_move(). dt_ms is ignored for move progression.
+        Progress increases by 1/fpm each tick so fractional frames_per_move
+        (e.g. 1.5) blend smoothly between integer speeds.
         """
-        if not self._animating or self._anim_done is None:
+        if not self._animating:
             return
-        self._anim_step += 1
+
         if self._anim_kind in ("move", "teleport"):
-            t = min(1.0, self._anim_step / float(self._anim_steps))
-            t = _ease_in_out(t)
+            span = self._fpm() if self._anim_kind == "move" else min(4.0, self._fpm())
+            self._anim_progress += 1.0 / span
+            t = min(1.0, self._anim_progress)
+            t_e = _ease_in_out(t)
             fx, fy = self._anim_from
             tx, ty = self._anim_to
-            self.sprite_x = fx + (tx - fx) * t
-            self.sprite_y = fy + (ty - fy) * t
-            if self._anim_step >= self._anim_steps:
+            self.sprite_x = fx + (tx - fx) * t_e
+            self.sprite_y = fy + (ty - fy) * t_e
+            if self._anim_progress >= 1.0:
                 self.sprite_x, self.sprite_y = tx, ty
-                self._finish_anim()
+                self._animating = False
+
         elif self._anim_kind == "bump":
-            t = min(1.0, self._anim_step / float(self._anim_steps))
-            t = _ease_in_out(t)
+            # Out and back: each half uses half the fpm span (min 1).
+            span = max(1.0, self._fpm() * 0.5)
+            self._anim_progress += 1.0 / span
+            t = min(1.0, self._anim_progress)
+            t_e = _ease_in_out(t)
             cx, cy = self._bump_center
             tx, ty = self._bump_target
             if self._bump_phase == 0:
-                self.sprite_x = cx + (tx - cx) * t
-                self.sprite_y = cy + (ty - cy) * t
-                if self._anim_step >= self._anim_steps:
+                self.sprite_x = cx + (tx - cx) * t_e
+                self.sprite_y = cy + (ty - cy) * t_e
+                if self._anim_progress >= 1.0:
                     self._bump_phase = 1
-                    self._anim_step = 0
+                    self._anim_progress = 0.0
             else:
-                self.sprite_x = tx + (cx - tx) * t
-                self.sprite_y = ty + (cy - ty) * t
-                if self._anim_step >= self._anim_steps:
+                self.sprite_x = tx + (cx - tx) * t_e
+                self.sprite_y = ty + (cy - ty) * t_e
+                if self._anim_progress >= 1.0:
                     self.sprite_x, self.sprite_y = cx, cy
-                    self._finish_anim()
+                    self._animating = False
         else:
-            self._finish_anim()
-
-    def _finish_anim(self) -> None:
-        self._animating = False
-        if self._anim_done is not None:
-            self._anim_done.set()
-            self._anim_done = None
-        self._anim_kind = None
-
-    # ------------------------------------------------------------------
-    # Camera
-    # ------------------------------------------------------------------
+            self._animating = False
 
     def update_camera(self, viewport_w: int, viewport_h: int, dt: float) -> None:
         """Spring each view-edge independently toward the focus box, then derive cam/zoom."""
@@ -553,16 +519,16 @@ class MazeRenderer:
             # An edge already on target stays put; only edges that need to
             # move (e.g. frontier grew on the right) accelerate.
             self.view_left, self._vel_left = self._spring_step(
-                self.view_left, self._vel_left, tl, CAMERA_OMEGA, dt
+                self.view_left, self._vel_left, tl, CAMERA_OMEGA * self._camera_omega_scale, dt
             )
             self.view_right, self._vel_right = self._spring_step(
-                self.view_right, self._vel_right, tr, CAMERA_OMEGA, dt
+                self.view_right, self._vel_right, tr, CAMERA_OMEGA * self._camera_omega_scale, dt
             )
             self.view_top, self._vel_top = self._spring_step(
-                self.view_top, self._vel_top, tt, CAMERA_OMEGA, dt
+                self.view_top, self._vel_top, tt, CAMERA_OMEGA * self._camera_omega_scale, dt
             )
             self.view_bottom, self._vel_bottom = self._spring_step(
-                self.view_bottom, self._vel_bottom, tb, CAMERA_OMEGA, dt
+                self.view_bottom, self._vel_bottom, tb, CAMERA_OMEGA * self._camera_omega_scale, dt
             )
 
         # Keep edges ordered and enforce viewport aspect by expanding only.
