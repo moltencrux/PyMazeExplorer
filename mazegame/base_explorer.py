@@ -26,8 +26,10 @@ How it works:
   - Call set_show_sprite(False) to hide the red agent dot (useful for
     frontier-style search where the highlight carries the visual).
 
-The camera automatically frames open leaves (visited cells that still have
-an unvisited open neighbour). Students do not need to manage that.
+The camera automatically frames open leaves (cells that have been *visually*
+revealed and still have an unvisited open neighbour). Students do not need
+to manage that; the visual frontier lags the algorithm so it stays in sync
+with the animation.
 
 You do NOT get direct access to the maze's wall layout. The only way to find
 out what's around you is to try moving (or call the can_move* helpers).

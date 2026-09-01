@@ -10,6 +10,13 @@ Threading model:
   - Path / sprite animation is applied on the main thread in poll() + tick().
   - frames_per_move and display FPS are owned by main; the engine does not
     throttle the algorithm except via queue depth.
+
+Exploration state:
+  - Two ExplorationState instances are kept: *logical* (worker) and *visual*
+    (main thread). The logical one drives algorithm queries (has_visited,
+    teleport eligibility, etc.). The visual one is advanced only when an
+    animation starts, so the camera and debug focus box stay consistent with
+    what the player has actually seen.
 """
 
 from __future__ import annotations
@@ -19,11 +26,12 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Callable, Deque, List, Optional, Set
+from typing import Callable, Deque, List, Optional
 
 from .base_explorer import BaseExplorer
 from .cell import Cell
 from .direction import Direction
+from .exploration_state import ExplorationState
 from .maze import Maze
 from .renderer import MazeRenderer
 
@@ -58,10 +66,13 @@ class MazeEngine:
         self.maze = maze
         self.renderer = renderer
         self.path_stack: Deque[Cell] = deque([maze.start])
-        # Every cell the explorer has successfully stepped onto (or started on).
-        # teleport() is only allowed to these cells.
-        self.visited: Set[Cell] = {maze.start}
-        self.visited_open: Set[Cell] = {maze.start}
+
+        # Logical state (worker thread) vs visual state (main / render thread).
+        # Camera and debug focus use the visual frontier so they stay in
+        # lock-step with the animation instead of running ahead of it.
+        self.logical = ExplorationState(maze, maze.start)
+        self.visual = ExplorationState(maze, maze.start)
+
         self.move_count = 0
         self.game_over = False
         self.paused = False
@@ -77,7 +88,7 @@ class MazeEngine:
         self._logic_cell = maze.start
         self._logic_path: List[Cell] = [maze.start]
         renderer.set_engine_state(maze, list(self.path_stack), maze.start)
-        self._recompute_frontier()
+        self.renderer.set_frontier(list(self.visual.get_frontier()))
 
     def set_goal_listener(self, listener: Callable[[int, int], None]) -> None:
         self._goal_listener = listener
@@ -117,8 +128,8 @@ class MazeEngine:
         self.stop_current()
         self.path_stack.clear()
         self.path_stack.append(self.maze.start)
-        self.visited = {self.maze.start}
-        self.visited_open = {self.maze.start}
+        self.logical.reset(self.maze.start)
+        self.visual.reset(self.maze.start)
         self.move_count = 0
         self.game_over = False
         self.paused = False
@@ -127,7 +138,7 @@ class MazeEngine:
         self._logic_cell = self.maze.start
         self._logic_path = [self.maze.start]
         self.renderer.set_engine_state(self.maze, list(self.path_stack), self.maze.start)
-        self._recompute_frontier()
+        self.renderer.set_frontier(list(self.visual.get_frontier()))
 
     def start(self, explorer: BaseExplorer) -> None:
         self.reset_to_start()
@@ -162,33 +173,17 @@ class MazeEngine:
     def can_move(self, direction: Direction) -> bool:
         current = self._logical_cell()
         target = current.moved(direction)
+        # Openness is enough for "can I try this direction"; the visit check
+        # is only needed when we actually discover a new cell.
         return self.maze.is_open_cell(target)
 
     def has_visited(self, cell: Cell) -> bool:
-        return cell in self.visited
+        return self.logical.is_visited(cell)
 
     def _logical_cell(self) -> Cell:
         """Cell the algorithm is at (may be ahead of the sprite)."""
         with self._lock:
             return self._logic_cell
-
-    def _recompute_frontier(self) -> None:
-        """
-        Open leaves = visited cells that still have an unvisited open neighbour.
-        Derived from the maze + visited set so explorers never manage a frontier.
-        """
-        frontier: List[Cell] = []
-        dead_ends: Set[Cell] = set()
-        for cell in self.visited_open:
-            for direction in Direction:
-                neighbour = cell.moved(direction)
-                if self.maze.is_open_cell(neighbour) and neighbour not in self.visited:
-                    frontier.append(cell)
-                    break
-            else:
-                dead_ends.add(cell)
-        self.visited_open -= dead_ends
-        self.renderer.set_frontier(frontier)
 
     def _enqueue(self, req: AnimRequest) -> None:
         """Post an anim; block only while the queue is at capacity."""
@@ -231,9 +226,9 @@ class MazeEngine:
             self._logic_cell = target
             new_path = list(self._logic_path)
 
-        self.visited.add(target)
-        self.visited_open.add(target)
-        self._recompute_frontier()
+        # Only the first time we step onto a cell do we expand the logical
+        # visited set / frontier. Re-visiting (backtracking) is a no-op.
+        self.logical.visit(target)
 
         self._enqueue(
             AnimRequest(
@@ -263,7 +258,7 @@ class MazeEngine:
         current = self._logical_cell()
         if cell == current:
             return True
-        if cell not in self.visited:
+        if not self.logical.is_visited(cell):
             return False
 
         # Teleport does not count as a "move attempt" for the counter, but
@@ -318,7 +313,14 @@ class MazeEngine:
         if req.kind == AnimKind.GOTO and req.to_cell is not None:
             if req.new_path is not None:
                 self.path_stack = deque(req.new_path)
+
+            # Advance the *visual* exploration state in lock-step with the
+            # animation. This keeps the camera / debug focus box consistent
+            # with what the player has actually seen.
+            self.visual.visit(req.to_cell)
+            self.renderer.set_frontier(list(self.visual.get_frontier()))
             self.renderer.mark_explored(req.to_cell)
+
             # Slide if graph-adjacent; hop otherwise — independent of move vs teleport API.
             if self._cells_adjacent(req.from_cell, req.to_cell):
                 self.renderer.animate_slide(req.from_cell, req.to_cell)

@@ -74,7 +74,6 @@ def _lerp_color(
 class MazeRenderer:
     def __init__(self) -> None:
         self.maze: Optional[Maze] = None
-        self.path: List[Cell] = []
         self.total_width = 0
         self.total_height = 0
         self.background: Optional[pygame.Surface] = None
