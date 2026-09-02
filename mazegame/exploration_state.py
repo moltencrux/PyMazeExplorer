@@ -30,9 +30,16 @@ class ExplorationState:
     def get_frontier(self) -> Set[Cell]:
         return self.frontier
 
+    # def can_visit(self, cell: Cell) -> bool:
+    #     """True if the cell is open and has not yet been visited."""
+    #     return self.maze.is_open_cell(cell) and cell not in self.visited
+
     def can_visit(self, cell: Cell) -> bool:
-        """True if the cell is open and has not yet been visited."""
-        return self.maze.is_open_cell(cell) and cell not in self.visited
+        """True if the cell has been visited, or neighbors a visited cell"""
+        return self.maze.is_open_cell(cell) and (
+            cell in self.visited
+            or any(cell.moved(d) in self.visited for d in Direction)
+        )
 
     def visit(self, cell: Cell) -> None:
         """
@@ -41,6 +48,9 @@ class ExplorationState:
         Caller is responsible for ensuring this is a legal discovery
         (e.g. an adjacent open cell reached by a normal move).
         """
+        if not self.can_visit(cell):
+            return
+
         if cell in self.visited:
             return
 

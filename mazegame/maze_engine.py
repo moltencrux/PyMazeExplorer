@@ -173,9 +173,7 @@ class MazeEngine:
     def can_move(self, direction: Direction) -> bool:
         current = self._logical_cell()
         target = current.moved(direction)
-        # Openness is enough for "can I try this direction"; the visit check
-        # is only needed when we actually discover a new cell.
-        return self.maze.is_open_cell(target)
+        return self.logical.can_visit(target)
 
     def has_visited(self, cell: Cell) -> bool:
         return self.logical.is_visited(cell)
@@ -393,7 +391,8 @@ self) -> float:
         goal = self.maze.goal
         dr = cur.row - goal.row
         dc = cur.col - goal.col
-        return math.sqrt(dr * dr + dc * dc)
+        # return math.sqrt(dr * dr + dc * dc)
+        return dr + dc
 
     def is_at_goal(self) -> bool:
         return self._logical_cell() == self.maze.goal
