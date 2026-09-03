@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import pygame
 
 from mazegame.base_explorer import BaseExplorer
-from mazegame.explorers import RandomWalkExplorer, WallFollowerExplorer
+from mazegame.explorers import AStarExplorer, DFSExplorer, RandomWalkExplorer, WallFollowerExplorer
 from mazegame.maze import Maze
 from mazegame.maze_engine import MazeEngine
 from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS, MAX_ANIMATION_STEPS
@@ -37,6 +37,8 @@ from mazegame.renderer import MazeRenderer, ROOM_SIZE, WALL_THICKNESS, MAX_ANIMA
 EXPLORERS: Dict[str, Callable[[], BaseExplorer]] = {
     "Random Walk (example)": RandomWalkExplorer,
     "Wall Follower (example)": WallFollowerExplorer,
+    "DFS Explorer": DFSExplorer,
+    "A* Explorer": AStarExplorer,
     # EXPLORERS["My Algorithm"] = MyExplorer
 }
 
