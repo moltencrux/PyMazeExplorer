@@ -14,7 +14,7 @@ Threading model:
 Exploration state:
   - Two ExplorationState instances are kept: *logical* (worker) and *visual*
     (main thread). The logical one drives algorithm queries (has_visited,
-    teleport eligibility, etc.). The visual one is advanced only when an
+    visit eligibility, etc.). The visual one is advanced only when an
     animation starts, so the camera and debug focus box stay consistent with
     what the player has actually seen.
 """
@@ -47,7 +47,7 @@ class MazeStoppedException(RuntimeError):
 
 
 class AnimKind(Enum):
-    GOTO = auto()   # move or teleport — anim chosen by adjacency at playback
+    GOTO = auto()   # move or visit — anim chosen by adjacency at playback
     BUMP = auto()
 
 
@@ -178,6 +178,10 @@ class MazeEngine:
     def has_visited(self, cell: Cell) -> bool:
         return self.logical.is_visited(cell)
 
+    def can_visit(self, cell: Cell) -> bool:
+        """True if visit(cell) would succeed (visited, or open adjacent to visited)."""
+        return self.logical.can_visit(cell)
+
     def _logical_cell(self) -> Cell:
         """Cell the algorithm is at (may be ahead of the sprite)."""
         with self._lock:
@@ -214,7 +218,6 @@ class MazeEngine:
             )
             return False
 
-        previous = None
         with self._lock:
             # Maintain a worker-side path for logical backtracking.
             if len(self._logic_path) >= 2 and self._logic_path[-2] == target:
@@ -243,11 +246,12 @@ class MazeEngine:
             self._pending_goal = (self.move_count, len(new_path))
         return True
 
-    def attempt_teleport(self, cell: Cell) -> bool:
+    def attempt_visit(self, cell: Cell) -> bool:
         """
-        Instantly move the sprite to a previously visited cell.
-        Returns True on success, False if the cell has never been visited
-        (or is the current cell — treated as a no-op success).
+        Instantly move to a reachable cell: any already-visited cell, or an
+        open cell orthogonally adjacent to a visited cell.
+        Returns True on success (including a no-op when already there).
+        First visit onto a new cell marks it visited.
         """
         if self.game_over or self._is_interrupted():
             raise MazeStoppedException()
@@ -256,10 +260,14 @@ class MazeEngine:
         current = self._logical_cell()
         if cell == current:
             return True
-        if not self.logical.is_visited(cell):
+        if not self.logical.can_visit(cell):
             return False
 
-        # Teleport does not count as a "move attempt" for the counter, but
+        # Discovering a frontier neighbour via visit expands the logical
+        # visited set the same way a normal step would.
+        self.logical.visit(cell)
+
+        # visit() does not count as a "move attempt" for the counter, but
         # we still animate so the UI stays in sync.
         new_path = [cell]
         with self._lock:
@@ -319,7 +327,7 @@ class MazeEngine:
             self.renderer.set_frontier(list(self.visual.get_frontier()))
             self.renderer.mark_explored(req.to_cell)
 
-            # Slide if graph-adjacent; hop otherwise — independent of move vs teleport API.
+            # Slide if graph-adjacent; hop otherwise — independent of move vs visit API.
             if self._cells_adjacent(req.from_cell, req.to_cell):
                 self.renderer.animate_slide(req.from_cell, req.to_cell)
             else:
@@ -385,14 +393,11 @@ class MazeEngine:
         """Backward-compatible alias for advance_playback()."""
         return self.advance_playback()
 
-    def get_hint(
-self) -> float:
-        cur = self._logical_cell()
+    def get_hint(self, cell: Optional[Cell] = None) -> float:
+        """Manhattan distance from *cell* (or the logical position) to the goal."""
+        cur = cell if cell is not None else self._logical_cell()
         goal = self.maze.goal
-        dr = cur.row - goal.row
-        dc = cur.col - goal.col
-        # return math.sqrt(dr * dr + dc * dc)
-        return dr + dc
+        return float(abs(cur.row - goal.row) + abs(cur.col - goal.col))
 
     def is_at_goal(self) -> bool:
         return self._logical_cell() == self.maze.goal

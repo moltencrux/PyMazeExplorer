@@ -30,16 +30,19 @@ class ExplorationState:
     def get_frontier(self) -> Set[Cell]:
         return self.frontier
 
-    # def can_visit(self, cell: Cell) -> bool:
-    #     """True if the cell is open and has not yet been visited."""
-    #     return self.maze.is_open_cell(cell) and cell not in self.visited
-
     def can_visit(self, cell: Cell) -> bool:
-        """True if the cell has been visited, or neighbors a visited cell"""
-        return self.maze.is_open_cell(cell) and (
-            cell in self.visited
-            or any(cell.moved(d) in self.visited for d in Direction)
-        )
+        """
+        True if visiting a *cell* is allowed: already visited, or open
+        and orthogonally adjacent to at least one visited cell.
+        """
+        if cell in self.visited:
+            return True
+        if not self.maze.is_open_cell(cell):
+            return False
+        for d in Direction:
+            if cell.moved(d) in self.visited:
+                return True
+        return False
 
     def visit(self, cell: Cell) -> None:
         """

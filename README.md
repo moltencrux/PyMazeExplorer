@@ -58,8 +58,8 @@ python main.py
 
 1. Create a new class that extends `BaseExplorer` (see `mazegame/explorers/random_walk.py` for the simplest example).
 2. Implement `solve()`. Inside it you can use:
-   - `move_up()`, `move_down()`, `move_left()`, `move_right()` — each returns `True` if the move succeeded and `False` if you hit a wall (you did **not** move in that case).
-   - `can_move_up()`, `can_move_down()`, `can_move_left()`, `can_move_right()` — probe without moving or animating.
+   - `move_up()`, `move_down()`, `move_left()`, `move_right()` `visit()`— each returns `True` if the move succeeded and `False` if you hit a wall (you did **not** move in that case).
+   - `can_move_up()`, `can_move_down()`, `can_move_left()`, `can_move_right()` `can_visit()`— probe without moving or animating.
    - `is_at_goal()`, `get_row()`, `get_col()`, `get_hint()` (Euclidean distance to goal).
 3. Register your class in `main.py`:
 

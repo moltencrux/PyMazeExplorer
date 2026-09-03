@@ -14,12 +14,15 @@ How it works:
   - Call can_move_up() / can_move_down() / can_move_left() / can_move_right()
     to test whether a move would succeed without actually performing it (no
     animation, no path change, no move count).
-  - Call teleport(cell) to jump instantly to a previously visited cell.
-    Returns True if the cell has been visited, False otherwise.
+  - Call visit(cell) to jump to a reachable cell: any previously visited
+    cell, or an open cell orthogonally adjacent to a visited cell. First
+    visit onto a new cell marks it visited. Returns True on success.
+  - Call can_visit(cell) to test whether visit(cell) would succeed
+    (no animation, no state change).
   - Call has_visited(cell) to check whether a cell is in the visited set.
   - Call is_at_goal() to check if you've reached the goal.
-  - Call get_hint() for a heuristic value (straight-line distance from your
-    current square to the goal).
+  - Call get_hint() / get_hint(cell) for a heuristic value (Manhattan
+    distance from your current square, or from an arbitrary cell, to the goal).
   - Call get_row() / get_col() to see where you currently are.
   - Call mark_explored(cell) to highlight a cell in the exploration overlay
     (optional; the engine already marks cells you step onto).
@@ -33,7 +36,7 @@ with the animation.
 
 You do NOT get direct access to the maze's wall layout. The only way to find
 out what's around you is to try moving (or call the can_move* helpers).
-Teleport only works for cells you have already stepped onto via move_*.
+visit works for visited cells and for open cells next to the visited set.
 """
 
 from __future__ import annotations
@@ -96,21 +99,29 @@ class BaseExplorer(ABC):
     def can_move_right(self) -> bool:
         return self.can_move(Direction.RIGHT)
 
-    def teleport(self, cell: Cell) -> bool:
+    def visit(self, cell: Cell) -> bool:
         """
-        Jump to a previously visited cell.
-        Returns True if the teleport succeeded (cell was visited, or is the
-        current cell). Returns False if the cell has never been stepped on.
+        Jump to a reachable cell: visited, or open and adjacent to visited.
+        First visit onto a new cell marks it visited.
+        Returns True on success (including a no-op when already there).
         """
-        return self._require_engine().attempt_teleport(cell)
+        return self._require_engine().attempt_visit(cell)
+
+    def can_visit(self, cell: Cell) -> bool:
+        """True if visit(cell) would succeed (no animation / no state change)."""
+        return self._require_engine().can_visit(cell)
 
     def has_visited(self, cell: Cell) -> bool:
         """True if the explorer has previously stepped onto this cell."""
         return self._require_engine().has_visited(cell)
 
-    def get_hint(self) -> float:
-        """Straight-line (Euclidean) distance to the goal. Smaller is closer."""
-        return self._require_engine().get_hint()
+    def get_hint(self, cell: Optional[Cell] = None) -> float:
+        """
+        Manhattan distance to the goal. Smaller is closer.
+        If *cell* is given, returns the hint for that cell without moving;
+        otherwise uses the explorer's current logical position.
+        """
+        return self._require_engine().get_hint(cell)
 
     def is_at_goal(self) -> bool:
         return self._require_engine().is_at_goal()
@@ -126,20 +137,6 @@ class BaseExplorer(ABC):
 
     def get_move_count(self) -> int:
         return self._require_engine().get_move_count()
-
-    def mark_explored(self, cell: Optional[Cell] = None) -> None:
-        """
-        Highlight a cell in the exploration overlay.
-        If cell is None, marks the explorer's current position.
-        """
-        eng = self._require_engine()
-        if cell is None:
-            cell = Cell(eng.get_row(), eng.get_col())
-        eng.mark_explored(cell)
-
-    def mark_explored_many(self, cells: List[Cell]) -> None:
-        """Mark several cells at once."""
-        self._require_engine().mark_explored_many(cells)
 
     def set_show_sprite(self, show: bool) -> None:
         """
