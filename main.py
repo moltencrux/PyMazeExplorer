@@ -390,7 +390,7 @@ class MazeApp:
         self.btn_explorer.enabled = True
         self.status = (
             f"Solved! {self._goal_moves} moves attempted, "
-            f"final path length {self._goal_path}."
+            f"solution path {self._goal_path} steps."
         )
         self._show_goal_dialog = False
 

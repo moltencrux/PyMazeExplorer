@@ -146,7 +146,26 @@ class MazeEngine:
 
         def runner() -> None:
             try:
-                explorer.solve()
+                result = explorer.solve()
+                if self._is_interrupted():
+                    return
+                # Prefer an explicit path from the explorer (needed for
+                # visit-based searches where the engine trail is not the
+                # solution). Fall back to the move-stack trail for simple
+                # walkers that only use move_* and return None.
+                if result is not None and len(result) > 0:
+                    path = list(result)
+                    with self._lock:
+                        self._logic_path = path
+                        self._logic_cell = path[-1]
+                    steps = max(0, len(path) - 1)
+                elif self.is_at_goal():
+                    with self._lock:
+                        steps = max(0, len(self._logic_path) - 1)
+                else:
+                    return
+                self.game_over = True
+                self._pending_goal = (self.move_count, steps)
             except MazeStoppedException:
                 pass
             except Exception:  # noqa: BLE001
@@ -203,9 +222,11 @@ class MazeEngine:
             raise MazeStoppedException()
         self._wait_if_paused()
 
-        self.move_count += 1
         current = self._logical_cell()
         target = current.moved(direction)
+
+        if not self.has_visited(target):
+            self.move_count += 1
 
         if not self.maze.is_open_cell(target):
             self._enqueue(
@@ -242,8 +263,9 @@ class MazeEngine:
         )
 
         if target == self.maze.goal:
+            # Stop the explorer loop; final path stats are recorded when
+            # solve() returns (so visit-based solvers can supply a path).
             self.game_over = True
-            self._pending_goal = (self.move_count, len(new_path))
         return True
 
     def attempt_visit(self, cell: Cell) -> bool:
@@ -252,6 +274,10 @@ class MazeEngine:
         open cell orthogonally adjacent to a visited cell.
         Returns True on success (including a no-op when already there).
         First visit onto a new cell marks it visited.
+
+        Visit does not maintain a meaningful start→goal trail (the engine
+        only tracks the current cell). Explorers that use visit should
+        return the reconstructed path from solve() so path length is correct.
         """
         if self.game_over or self._is_interrupted():
             raise MazeStoppedException()
@@ -263,13 +289,16 @@ class MazeEngine:
         if not self.logical.can_visit(cell):
             return False
 
+        if not self.has_visited(cell):
+            self.move_count += 1
+
         # Discovering a frontier neighbour via visit expands the logical
         # visited set the same way a normal step would.
         self.logical.visit(cell)
 
         # visit() does not count as a "move attempt" for the counter, but
-        # we still animate so the UI stays in sync.
-        new_path = [cell]
+        # we still animate so the UI stays in sync. Trail is not the solution
+        # path — only the current cell is recorded for sprite position.
         with self._lock:
             self._logic_path = [cell]
             self._logic_cell = cell
@@ -280,13 +309,12 @@ class MazeEngine:
                 from_cell=current,
                 to_cell=cell,
                 direction=None,
-                new_path=new_path,
+                new_path=[cell],
             )
         )
 
         if cell == self.maze.goal:
             self.game_over = True
-            self._pending_goal = (self.move_count, len(new_path))
         return True
 
     def mark_explored(self, cell: Cell) -> None:

@@ -6,7 +6,9 @@ How it works:
   - Override solve(). This method is the algorithm's entry point. It runs on
     its own background thread, so you are free to use a loop, recursion, a
     stack, a queue — whatever your algorithm needs — without freezing the
-    display.
+    display. Optionally return the path from start to goal (list of cells);
+    the engine uses that for the reported path length. Return None to fall
+    back to the engine's move-stack trail (fine for simple walkers).
   - Call move_up() / move_down() / move_left() / move_right() to attempt to
     move one square. Each call blocks until the move animation finishes and
     returns True if the move succeeded, or False if it was blocked by a wall
@@ -42,7 +44,7 @@ visit works for visited cells and for open cells next to the visited set.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 from .cell import Cell
 from .direction import Direction
@@ -60,8 +62,15 @@ class BaseExplorer(ABC):
         self._engine = engine
 
     @abstractmethod
-    def solve(self) -> None:
-        """Your maze-solving algorithm goes here."""
+    def solve(self) -> Optional[Sequence[Cell]]:
+        """
+        Your maze-solving algorithm goes here.
+
+        Optionally return the path from start to goal (inclusive list of cells)
+        when you find a solution. The engine uses that for the reported path
+        length. Return None (or omit a return) to fall back to the engine's
+        move-stack trail — fine for simple walkers that only use move_*.
+        """
         ...
 
     def _require_engine(self) -> MazeEngine:
